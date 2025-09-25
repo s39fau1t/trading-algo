@@ -1,0 +1,19 @@
+{
+  "name": "trading-algo",
+  "version": "1.0.0",
+  "description": "",
+  "homepage": "https://github.com/s39fau1t/trading-algo#readme",
+  "bugs": {
+    "url": "https://github.com/s39fau1t/trading-algo/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/s39fau1t/trading-algo.git"
+  },
+  "author": "",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  }
+}
