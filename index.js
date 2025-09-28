@@ -7,10 +7,49 @@ import Alpaca from "@alpacahq/alpaca-trade-api";
 const alpaca = new Alpaca({
     keyId: "PKF2GCQC43DWPXMO8VQS",
     secretKey: "kKf6mS70NWynKQeu7IgA0F3scyXPqUAeOfZ3OcXO",
+    feed: "iex",
     paper: true
 });
 
-console.log(await alpaca.getAccount());
+const ws = alpaca.data_stream_v2;
+ws.connect();
+ws.onConnect(() => {
+    ws.subscribeForQuotes(["*"]);
+});
+ws.onStockQuote(quote => {
+    console.log(quote);
+});
+
+/*
+const assets = await alpaca.getAssets({
+    status: "active",
+    asset_class: "us_equity"
+});
+
+
+
+//TODO: check the time
+while(true) {
+    //TODO: fix looping
+    //TODO: rate limit
+    const symbols = assets.filter(asset => asset.tradable && (asset.exchange === "NYSE" || asset.exchange === "NASDAQ")).map(asset => asset.symbol);
+
+    const prices = await alpaca.getSnapshots(symbols);
+
+    const scanThese = prices.filter(stock => (stock.LatestQuote ?? {AskPrice: -1}).AskPrice > 5);
+}
+    */
+
+//getsnapshot
+
+
+
+//const ws = new WebSocket("wss://stream.data.alpaca.markets/v2/iex");
+
+
+
+
+//
 
 /*
 //API constants
