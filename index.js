@@ -32,6 +32,13 @@ async function request(path, type, options = {
         }
     });
 
+    /*
+    TODO: look at these headers for possibly more efficient ratelimiting
+    console.log(res.headers.get("X-RateLimit-Limit"));
+    console.log(res.headers.get("X-RateLimit-Remaining"));
+    console.log(res.headers.get("X-RateLimit-Reset"));
+    */
+
     return await res.json();
 }
 
@@ -44,10 +51,50 @@ const assets = await request("assets", API.PAPER, {
 
 const symbols = assets.filter(asset => asset.tradable && (asset.exchange === "NYSE")).map(asset => asset.symbol);
 
-const quotes = await request("stocks/quotes/latest", API.DATA, {
+async function algo(lastSnapshots) {
+    //TODO: check time
+
+    const snapshots = await request("stocks/snapshots", API.DATA, {
+        params: {
+            symbols
+        }
+    });
+
+    const stocks = [];
+
+    for(const [symbol, snapshot] of Object.entries(snapshots)) {
+        const ask = snapshot.latestQuote.ap;
+
+        if(ask < 5) {
+            continue;
+        }
+
+        const lastAsk = lastSnapshots[symbol].latestQuote.ap;
+
+        stocks.push({
+            symbol,
+            volume: snapshot.minuteBar.v,
+            change: (ask - lastAsk) / lastAsk
+        });
+    }
+
+    stocks.sort((a, b) => {
+        if(a.change > b.change) {
+            return -1;
+        }else if(a.change < b.change) {
+            return 1;
+        }
+
+        return 0;
+    });
+
+    for(const [symbol, stock] of Object.entries(stocks)) {
+        //calculate how much to buy
+    }
+}
+
+setInterval(algo, 10 * 60 * 1000, await request("stocks/snapshots", API.DATA, {
     params: {
         symbols
     }
-});
-
-console.log(quotes);
+}));
