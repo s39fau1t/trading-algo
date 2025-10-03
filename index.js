@@ -24,15 +24,15 @@ const PARAMS = {
     //Minimum price of a stock before consider buying it (dollars)
     MIN_PRICE: 5,
     //Maximum percentage of the portfolio that can be one stock
-    MAX_PERCENTAGE_PER_STOCK: 0.3,
+    MAX_PERCENTAGE_PER_STOCK: 0.03,
     //Multiplier for the amount to spend on a particular stock
     SPEND_MULT: 0.05,
     //Maximum percentage of buying power that can be spent on a particular stock at once
-    MAX_BUYING_POWER_AT_ONCE: 0.2,
+    MAX_BUYING_POWER_AT_ONCE: 0.02,
     //Multiplier to calculate the take profit price for bracket orders (ask price * LIMIT_PRICE_MULT = limit_price)
     LIMIT_PRICE_MULT: 1.1,
     //Multiplier to calculate the stop price (ask price * STOP_PRICE_MULT = stop_price)
-    STOP_PRICE_MULT: 0.95,
+    STOP_PRICE_MULT: 0.995,
     //Percent away from the highest water mark for trailing stop orders
     TRAILING_STOP_PERCENT: 1,
     //Time to cancel all orders and close out of all positions (24-hr, eastern time)
