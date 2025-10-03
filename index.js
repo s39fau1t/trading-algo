@@ -90,7 +90,7 @@ const symbols = assets.filter(asset => asset.tradable && (asset.exchange === "NY
 
 let moneySpent = 0;
 
-let handle;
+let handle, lastSnapshots;
 
 async function cleanup() {
     clearInterval(handle);
@@ -109,10 +109,10 @@ async function cleanup() {
     }, cleanupTime.valueOf - now.valueOf);
 }
 
-async function algo(lastSnapshots) {
+async function algo() {
     //TODO: how to ensure Eastern Time??
     const now = new Date();
-    if((now.getHours() === PARAMS.CLOSING.HOURS && now.getMinutes() + PARAMS.INTERVAL / 60 / 1000 >= PARAMS.CLOSING.MINUTES) || moneySpent === PARAMS.MAX_PER_DAY) {
+    if((now.getHours() === PARAMS.CLOSING.HOURS && now.getMinutes() + PARAMS.INTERVAL / 60 / 1000 >= PARAMS.CLOSING.MINUTES)) {
         await cleanup();
     }
 
@@ -214,10 +214,18 @@ async function algo(lastSnapshots) {
             break;
         }
     }
+
+    if(moneySpent === PARAMS.MAX_PER_DAY) {
+        await cleanup();
+    }
+
+    lastSnapshots = snapshots;
 }
 
-handle = setInterval(algo, PARAMS.INTERVAL, await request("stocks/snapshots", API.DATA, {
+lastSnapshots = await request("stocks/snapshots", API.DATA, {
     params: {
         symbols
     }
-}));
+});
+
+handle = setInterval(algo, PARAMS.INTERVAL);
