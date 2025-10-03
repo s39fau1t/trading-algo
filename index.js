@@ -128,7 +128,7 @@ async function algo() {
         const ask = snapshot.latestQuote.ap;
 
         //sometimes minute bar is not available
-        if(ask < PARAMS.MIN_PRICE || !snapshot.minuteBar) {
+        if(ask < PARAMS.MIN_PRICE || !snapshot.minuteBar || !snapshot.latestQuote) {
             continue;
         }
 
