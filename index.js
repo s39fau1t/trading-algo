@@ -217,12 +217,14 @@ async function algo() {
             })
         });
 
-        if(moneySpent === PARAMS.MAX_PER_DAY) {
+        //since we're only buying whole shares, this ensures the algo won't run infinetly doing nothing
+        //we know we won't be able to buy any more shares anyway in this case, so just exit
+        if(moneySpent + PARAMS.MIN_PRICE > PARAMS.MAX_PER_DAY) {
             break;
         }
     }
 
-    if(moneySpent === PARAMS.MAX_PER_DAY) {
+    if(moneySpent + PARAMS.MIN_PRICE > PARAMS.MAX_PER_DAY) {
         await cleanup();
     }
 
