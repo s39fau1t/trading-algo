@@ -8,14 +8,13 @@ const API = Object.freeze({
     DOMAIN: "alpaca.markets/v2",
     KEY: "PKF2GCQC43DWPXMO8VQS",
     SECRET: "kKf6mS70NWynKQeu7IgA0F3scyXPqUAeOfZ3OcXO",
-    PAPER: "paper-api",
+    TRADE: "paper-api",
     DATA: "data"
 });
 
 const RATELIMIT_MAX_REQ = 200;
 const RATELIMIT_TIMESPAN = 1 * 60 * 1000;
 
-//TODO
 const PARAMS = {
     //Interval between each iteration of the algo (ms)
     INTERVAL: 10 * 60 * 1000,
@@ -79,7 +78,7 @@ async function request(path, type, options = {
     return await noRatelimitRequest(path, type, options);
 }
 
-const assets = await request("assets", API.PAPER, {
+const assets = await request("assets", API.TRADE, {
     params: {
         status: "active",
         asset_class: "us_equity"
@@ -100,7 +99,7 @@ async function cleanup() {
     cleanupTime.setMinutes(30);
 
     setTimeout(async () => {
-        await request("positions", API.PAPER, {
+        await request("positions", API.TRADE, {
             method: "DELETE",
             params: {
                 cancel_orders: true
@@ -125,10 +124,13 @@ async function algo() {
     const stocks = [];
 
     for(const [symbol, snapshot] of Object.entries(snapshots)) {
-        const ask = snapshot.latestQuote.ap;
+        //sometimes minute bar or latest quote is not available
+        if(!snapshot.minuteBar || !snapshot.latestQuote) {
+            continue;
+        }
 
-        //sometimes minute bar is not available
-        if(ask < PARAMS.MIN_PRICE || !snapshot.minuteBar || !snapshot.latestQuote) {
+        const ask = snapshot.latestQuote.ap;
+        if(ask < PARAMS.MIN_PRICE || lastAsk === 0) {
             continue;
         }
 
@@ -152,37 +154,42 @@ async function algo() {
         return 0;
     });
 
-    const account = await request("account", API.PAPER);
+    const account = await request("account", API.TRADE);
     const equity = parseFloat(account.equity);
     const buyingPower = parseFloat(account.cash);
 
     for(const [symbol, stock] of Object.entries(stocks)) {
-        const curPosition = await request(`positions/${symbol}`, API.PAPER);
+        const curPosition = await request(`positions/${symbol}`, API.TRADE);
 
         if(curPosition.market_value / equity >= PARAMS.MAX_PERCENTAGE_PER_STOCK) {
             continue;
         }
 
-        //$ amount to buy
+        //$ amount to buy (probably fractional)
         let notional = toDollars(Math.min(buyingPower * PARAMS.MAX_BUYING_POWER_AT_ONCE, stock.volume * stock.ask * PARAMS.SPEND_MULT));
 
-        if(moneySpent + notional >= PARAMS.MAX_PER_DAY) {
+        //try to spend the last of our money if we were going to go over
+        if(moneySpent + notional > PARAMS.MAX_PER_DAY) {
             notional = PARAMS.MAX_PER_DAY - moneySpent;
-
-            moneySpent = PARAMS.MAX_PER_DAY;
-
-            if(notional === 0) {
-                break;
-            }
-        }else {
-            moneySpent += notional;
         }
 
-        await request("orders", API.PAPER, {
+        //convert to shares
+        const qty = Math.floor(notional / stock.ask);
+
+        //don't bother buying 0 shares :)
+        //this, along with the if statement above, also implicitly ensures that we don't go over our spending limit
+        if(qty === 0) {
+            continue;
+        }
+
+        //actual dollar amount we're buying now
+        moneySpent += qty * stock.ask;
+
+        await request("orders", API.TRADE, {
             method: "POST",
             body: JSON.stringify({
                 symbol,
-                notional,
+                qty,
                 side: "buy",
                 type: "market",
                 time_in_force: "day",
@@ -198,11 +205,11 @@ async function algo() {
 
         //no need to wait for a response to do the next order
         await ratelimiter.consume();
-        noRatelimitRequest("orders", API.PAPER, {
+        noRatelimitRequest("orders", API.TRADE, {
             method: "POST",
             body: JSON.stringify({
                 symbol,
-                notional,
+                qty,
                 side: "sell",
                 type: "trailing_stop",
                 time_in_force: "day",

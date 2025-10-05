@@ -19,7 +19,6 @@ export default class Ratelimiter {
             if(++this.tokens <= this.maxTokens) {
                 resolve();
             }else {
-                console.log("waiting");
                 setTimeout(() => {
                     this.consume();
 
