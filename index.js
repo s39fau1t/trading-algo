@@ -105,7 +105,7 @@ async function cleanup() {
                 cancel_orders: true
             }
         });
-    }, cleanupTime.valueOf - now.valueOf);
+    }, cleanupTime.valueOf() - Date.now());
 }
 
 async function algo() {
@@ -129,12 +129,12 @@ async function algo() {
             continue;
         }
 
+        const lastAsk = lastSnapshots[symbol].latestQuote.ap;
+
         const ask = snapshot.latestQuote.ap;
         if(ask < PARAMS.MIN_PRICE || lastAsk === 0) {
             continue;
         }
-
-        const lastAsk = lastSnapshots[symbol].latestQuote.ap;
 
         stocks.push({
             symbol,
@@ -158,8 +158,8 @@ async function algo() {
     const equity = parseFloat(account.equity);
     const buyingPower = parseFloat(account.cash);
 
-    for(const [symbol, stock] of Object.entries(stocks)) {
-        const curPosition = await request(`positions/${symbol}`, API.TRADE);
+    for(const stock of stocks) {
+        const curPosition = await request(`positions/${stock.symbol}`, API.TRADE);
 
         if(curPosition.market_value / equity >= PARAMS.MAX_PERCENTAGE_PER_STOCK) {
             continue;
@@ -184,31 +184,33 @@ async function algo() {
 
         //actual dollar amount we're buying now
         moneySpent += qty * stock.ask;
-
-        await request("orders", API.TRADE, {
+//TODO
+        const res =  await request("orders", API.TRADE, {
             method: "POST",
             body: JSON.stringify({
-                symbol,
+                symbol: stock.symbol,
                 qty,
                 side: "buy",
                 type: "market",
                 time_in_force: "day",
                 order_class: "bracket",
                 take_profit : {
-                    limit_price: toDollars(stock.ask * PARAMS.LIMIT_PRICE_MULT)
+                    limit_price: Math.max(toDollars(stock.ask * PARAMS.LIMIT_PRICE_MULT), stock.ask + 0.01) //TODO: stock.ask is not the price we always get in a market order
                 },
                 stop_loss: {
-                    stop_price: toDollars(stock.ask * PARAMS.STOP_PRICE_MULT)
+                    stop_price: Math.min(toDollars(stock.ask * PARAMS.STOP_PRICE_MULT), stock.ask - 0.01)
                 }
             })
         });
+
+        console.log(res);
 
         //no need to wait for a response to do the next order
         await ratelimiter.consume();
         noRatelimitRequest("orders", API.TRADE, {
             method: "POST",
             body: JSON.stringify({
-                symbol,
+                symbol: stock.symbol,
                 qty,
                 side: "sell",
                 type: "trailing_stop",
