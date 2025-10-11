@@ -1,6 +1,12 @@
-def main():
-    print("Hello from trading-algo!")
+from ib_async import *
 
+ib = IB()
+ib.connect('127.0.0.1', 7497, clientId=1)
 
-if __name__ == "__main__":
-    main()
+# Get account summary
+account = ib.managedAccounts()[0]
+summary = ib.accountSummary(account)
+for item in summary:
+    print(f"{item.tag}: {item.value}")
+
+ib.disconnect()
