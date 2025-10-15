@@ -66,6 +66,20 @@ function getEasternTimeParts(date = new Date()) {
     };
 }
 
+// New: get ET date key (YYYY-MM-DD)
+function getETDateKey(date = new Date()) {
+    const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/New_York",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit"
+    }).formatToParts(date).reduce((acc, p) => {
+        acc[p.type] = p.value;
+        return acc;
+    }, {});
+    return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
 function toDollars(x) {
     return Math.round(x * 100) / 100;
 }
@@ -162,6 +176,20 @@ const assets = await request("assets", API.TRADE, {
 const symbols = assets.filter(asset => asset.tradable && (asset.exchange === "NYSE")).map(asset => asset.symbol);
 
 let moneySpent = 0;
+// New: track day + initial buying power (ET)
+let initialBuyingPower = 0;
+let currentDayKey = null;
+
+// New: ensure day state (reset on ET date change)
+async function ensureDayState() {
+    const dayKey = getETDateKey();
+    if (currentDayKey !== dayKey || !initialBuyingPower) {
+        const account = await request("account", API.TRADE);
+        initialBuyingPower = parseFloat(account.cash || "0");
+        currentDayKey = dayKey;
+        moneySpent = 0;
+    }
+}
 
 let handle, lastSnapshots;
 
@@ -192,6 +220,8 @@ async function algo() {
     if (etHour === PARAMS.CLOSING.HOURS && etMinute + PARAMS.INTERVAL / 60 / 1000 >= PARAMS.CLOSING.MINUTES) {
         await cleanup();
     }
+
+    await ensureDayState();
 
     const snapshots = await request("stocks/snapshots", API.DATA, {
         params: {
@@ -251,37 +281,40 @@ async function algo() {
             continue;
         }
 
-        // Try to buy ITM call options first (nearest expiry, strike <= 95% of ask, closest to that)
+        // Per-trade sizing caps
+        const perTradeCap = toDollars(initialBuyingPower * 0.02); // 2% of initial day BP
+        const volumeCap = toDollars(stock.volume * stock.ask * PARAMS.SPEND_MULT); // 5% of current minute volume $
+        let targetNotional = Math.min(perTradeCap, volumeCap);
+
+        // Skip if target notional would exceed remaining daily budget
+        if (moneySpent + targetNotional > PARAMS.MAX_PER_DAY) {
+            continue;
+        }
+
+        // Try to buy ITM call options first using the same target notional
         let didOptionTrade = false;
         try {
             const targetStrike = stock.ask * 0.95;
             const contract = await getNearestITMCallContract(stock.symbol, targetStrike);
             if (contract && contract.symbol) {
-                // Get latest option quote for pricing
                 const quotes = await request("options/quotes/latest", API.DATA, {
                     params: { symbols: contract.symbol }
                 });
-
-                // Handle possible shapes: { [symbol]: { ap } } or { latestQuotes: { ... } }
                 const optQuote = quotes[contract.symbol] || quotes.latestQuote || quotes.latestQuotes?.[contract.symbol];
                 const optAsk = optQuote?.ap || optQuote?.ask_price || 0;
 
                 if (optAsk > 0) {
-                    // Determine spend (premium dollars). Use same notional rule as stock.
-                    let notional = toDollars(Math.min(
-                        buyingPower * PARAMS.MAX_BUYING_POWER_AT_ONCE,
-                        stock.volume * stock.ask * PARAMS.SPEND_MULT
-                    ));
-
-                    if (moneySpent + notional > PARAMS.MAX_PER_DAY) {
-                        notional = PARAMS.MAX_PER_DAY - moneySpent;
-                    }
-
-                    // Convert to contracts (100x multiplier) — enforce whole contracts
-                    const contractsQty = toWholeQty(notional / (optAsk * 100));
-
+                    // Calculate whole contracts from target notional (100x multiplier)
+                    const contractsQty = toWholeQty(targetNotional / (optAsk * 100));
                     if (contractsQty > 0) {
-                        // Buy option contracts (market)
+                        const notionalOpt = toDollars(contractsQty * optAsk * 100);
+
+                        // Skip if insufficient cash
+                        if (notionalOpt > buyingPower) {
+                            continue;
+                        }
+
+                        // Place buy order (option)
                         const buyOrder = await request("orders", API.TRADE, {
                             method: "POST",
                             body: JSON.stringify({
@@ -310,8 +343,8 @@ async function algo() {
                             continue;
                         }
 
-                        // Record spend
-                        moneySpent += contractsQty * optAsk * 100;
+                        // Record spend using actual notional
+                        moneySpent += notionalOpt;
 
                         // Compute entry price and take profit for option (per-contract premium)
                         const entryPriceOpt = parseFloat(buyOrderStatus.filled_avg_price || optAsk);
@@ -574,5 +607,8 @@ lastSnapshots = await request("stocks/snapshots", API.DATA, {
         symbols
     }
 });
+
+// Initialize day state once at startup
+await ensureDayState();
 
 handle = setInterval(algo, PARAMS.INTERVAL);
