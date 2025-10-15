@@ -99,6 +99,51 @@ async function request(path, type, options = {
     return await noRatelimitRequest(path, type, options);
 }
 
+// Helpers for options trading
+function getUnderlyingFromOptionSymbol(sym) {
+    // Extract leading letters/dots as underlying (e.g., AAPL240118C00190000 -> AAPL)
+    const m = String(sym).match(/^[A-Z.]+/);
+    return m ? m[0] : sym;
+}
+
+async function getNearestITMCallContract(underlying, targetPrice) {
+    // Fetch active call contracts for the underlying
+    const resp = await request("options/contracts", API.DATA, {
+        params: {
+            underlying_symbols: underlying,
+            status: "active",
+            type: "call",
+            limit: 1000
+        }
+    });
+    const contracts = Array.isArray(resp) ? resp : (resp.contracts || []);
+    if (!contracts.length) return null;
+
+    const now = new Date();
+    // Choose the nearest expiration date not in the past
+    const future = contracts
+        .filter(c => c.underlying_symbol === underlying)
+        .filter(c => new Date(c.expiration_date) >= now);
+
+    if (!future.length) return null;
+
+    const nearestDate = future
+        .map(c => c.expiration_date)
+        .sort((a, b) => new Date(a) - new Date(b))[0];
+
+    const sameExpiry = future.filter(c => c.expiration_date === nearestDate);
+
+    // Pick the call with strike <= targetPrice and closest to target (i.e., max strike <= target)
+    const target = Number(targetPrice);
+    const candidates = sameExpiry
+        .filter(c => Number(c.strike_price) <= target);
+
+    if (!candidates.length) return null;
+
+    candidates.sort((a, b) => Number(b.strike_price) - Number(a.strike_price));
+    return candidates[0]; // has .symbol, .strike_price, .expiration_date
+}
+
 const assets = await request("assets", API.TRADE, {
     params: {
         status: "active",
@@ -183,13 +228,147 @@ async function algo() {
     const equity = parseFloat(account.equity);
     const buyingPower = parseFloat(account.cash);
 
-    for(const stock of stocks) {
-        const curPosition = await request(`positions/${stock.symbol}`, API.TRADE);
+    // Build combined exposure (equity + options) by underlying symbol
+    const positions = await request("positions", API.TRADE);
+    const exposureByUnderlying = {};
+    for (const p of positions) {
+        const underlying = p.asset_class === "option" ? getUnderlyingFromOptionSymbol(p.symbol) : p.symbol;
+        exposureByUnderlying[underlying] = (exposureByUnderlying[underlying] || 0) + parseFloat(p.market_value);
+    }
 
-        if(curPosition.market_value / equity >= PARAMS.MAX_PERCENTAGE_PER_STOCK) {
+    for (const stock of stocks) {
+        // Enforce combined exposure limit
+        const combinedMV = exposureByUnderlying[stock.symbol] || 0;
+        if (combinedMV / equity >= PARAMS.MAX_PERCENTAGE_PER_STOCK) {
             continue;
         }
 
+        // Try to buy ITM call options first (nearest expiry, strike <= 95% of ask, closest to that)
+        let didOptionTrade = false;
+        try {
+            const targetStrike = stock.ask * 0.95;
+            const contract = await getNearestITMCallContract(stock.symbol, targetStrike);
+            if (contract && contract.symbol) {
+                // Get latest option quote for pricing
+                const quotes = await request("options/quotes/latest", API.DATA, {
+                    params: { symbols: contract.symbol }
+                });
+
+                // Handle possible shapes: { [symbol]: { ap } } or { latestQuotes: { ... } }
+                const optQuote = quotes[contract.symbol] || quotes.latestQuote || quotes.latestQuotes?.[contract.symbol];
+                const optAsk = optQuote?.ap || optQuote?.ask_price || 0;
+
+                if (optAsk > 0) {
+                    // Determine spend (premium dollars). Use same notional rule as stock.
+                    let notional = toDollars(Math.min(
+                        buyingPower * PARAMS.MAX_BUYING_POWER_AT_ONCE,
+                        stock.volume * stock.ask * PARAMS.SPEND_MULT
+                    ));
+
+                    if (moneySpent + notional > PARAMS.MAX_PER_DAY) {
+                        notional = PARAMS.MAX_PER_DAY - moneySpent;
+                    }
+
+                    // Convert to contracts (100x multiplier)
+                    const contractsQty = Math.floor(notional / (optAsk * 100));
+
+                    if (contractsQty > 0) {
+                        // Buy option contracts (market)
+                        const buyOrder = await request("orders", API.TRADE, {
+                            method: "POST",
+                            body: JSON.stringify({
+                                symbol: contract.symbol,
+                                asset_class: "option",
+                                qty: contractsQty,
+                                side: "buy",
+                                type: "market",
+                                time_in_force: "day"
+                            })
+                        });
+
+                        // Wait for fill
+                        let filled = false;
+                        let buyOrderStatus;
+                        for (let i = 0; i < 10; i++) {
+                            buyOrderStatus = await request(`orders/${buyOrder.id}`, API.TRADE);
+                            if (buyOrderStatus.status === "filled") {
+                                filled = true;
+                                break;
+                            }
+                            await new Promise(res => setTimeout(res, 2000));
+                        }
+                        if (!filled) {
+                            // If not filled, skip bracket creation and fall back to next stock
+                            continue;
+                        }
+
+                        // Record spend
+                        moneySpent += contractsQty * optAsk * 100;
+
+                        // Place stop-loss sell (option)
+                        const stopLossPrice = Math.min(toDollars(optAsk * PARAMS.STOP_PRICE_MULT), optAsk - 0.01);
+                        const stopLossOrder = await request("orders", API.TRADE, {
+                            method: "POST",
+                            body: JSON.stringify({
+                                symbol: contract.symbol,
+                                asset_class: "option",
+                                qty: contractsQty,
+                                side: "sell",
+                                type: "stop",
+                                time_in_force: "gtc",
+                                stop_price: stopLossPrice
+                            })
+                        });
+
+                        // Place trailing stop sell (option)
+                        const trailingStopOrder = await request("orders", API.TRADE, {
+                            method: "POST",
+                            body: JSON.stringify({
+                                symbol: contract.symbol,
+                                asset_class: "option",
+                                qty: contractsQty,
+                                side: "sell",
+                                type: "trailing_stop",
+                                time_in_force: "gtc",
+                                trail_percent: PARAMS.TRAILING_STOP_PERCENT
+                            })
+                        });
+
+                        // OCO monitor
+                        let ocoResolved = false;
+                        while (!ocoResolved) {
+                            const [slStatus, tsStatus] = await Promise.all([
+                                request(`orders/${stopLossOrder.id}`, API.TRADE),
+                                request(`orders/${trailingStopOrder.id}`, API.TRADE)
+                            ]);
+                            if (slStatus.status === "filled") {
+                                await request(`orders/${trailingStopOrder.id}`, API.TRADE, { method: "DELETE" });
+                                ocoResolved = true;
+                            } else if (tsStatus.status === "filled") {
+                                await request(`orders/${stopLossOrder.id}`, API.TRADE, { method: "DELETE" });
+                                ocoResolved = true;
+                            } else if (slStatus.status === "canceled" && tsStatus.status === "canceled") {
+                                ocoResolved = true;
+                            } else {
+                                await new Promise(res => setTimeout(res, 5000));
+                            }
+                        }
+
+                        // If we reached here, option trade completed; skip stock trade
+                        didOptionTrade = true;
+
+                        if (moneySpent + PARAMS.MIN_PRICE > PARAMS.MAX_PER_DAY) {
+                            break;
+                        }
+                    }
+                }
+            }
+        } catch (_) {
+            // Swallow option errors and fall back to stock path
+        }
+        if (didOptionTrade) continue;
+
+        // Fallback: original stock trade path
         //$ amount to buy (probably fractional)
         let notional = toDollars(Math.min(buyingPower * PARAMS.MAX_BUYING_POWER_AT_ONCE, stock.volume * stock.ask * PARAMS.SPEND_MULT));
 
