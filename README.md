@@ -6,7 +6,7 @@ Prerequisites:
 
 Setup:
 1. Clone the repo and open the project directory.
-2. (Optional) Replace the hardcoded API.KEY and API.SECRET in index.js with your own paper keys.
+2. (Optional) Replace the hardcoded API.KEY and API.SECRET in index.js with your own paper keys. (The current API.KEY and API.SECRET are that of Milo's paper trading account)
 3. Install dependencies (none required, but this ensures tooling is ready):
    ```
    npm install

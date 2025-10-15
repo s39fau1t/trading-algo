@@ -1,6 +1,6 @@
 //alpaca paper trading
-//key: PKF2GCQC43DWPXMO8VQS
-//secret: kKf6mS70NWynKQeu7IgA0F3scyXPqUAeOfZ3OcXO
+//key: PKEMJZFGOJ6JDHDOLOJC6PYE2D
+//secret: GL3UD9kbckymMGBWF7cHvniPo8RFgENrE33BpZJWtVHz
 //testing commit
 //testing commit 3
 
@@ -8,8 +8,8 @@ import Ratelimiter from "./ratelimiter.js";
 
 const API = Object.freeze({
     DOMAIN: "alpaca.markets/v2",
-    KEY: "PKF2GCQC43DWPXMO8VQS",
-    SECRET: "kKf6mS70NWynKQeu7IgA0F3scyXPqUAeOfZ3OcXO",
+    KEY: "PKF2GCQCPKEMJZFGOJ6JDHDOLOJC6PYE2D",
+    SECRET: "GL3UD9kbckymMGBWF7cHvniPo8RFgENrE33BpZJWtVHz",
     TRADE: "paper-api",
     DATA: "data"
 });
