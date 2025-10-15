@@ -45,6 +45,25 @@ const PARAMS = {
 
 const ratelimiter = new Ratelimiter(RATELIMIT_MAX_REQ, RATELIMIT_TIMESPAN);
 
+// Helper: get Eastern Time parts (HH:mm:ss)
+function getEasternTimeParts(date = new Date()) {
+    const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/New_York",
+        hour12: false,
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit"
+    }).formatToParts(date).reduce((acc, p) => {
+        acc[p.type] = p.value;
+        return acc;
+    }, {});
+    return {
+        hour: parseInt(parts.hour, 10),
+        minute: parseInt(parts.minute, 10),
+        second: parseInt(parts.second, 10)
+    };
+}
+
 function toDollars(x) {
     return Math.round(x * 100) / 100;
 }
@@ -96,9 +115,13 @@ let handle, lastSnapshots;
 async function cleanup() {
     clearInterval(handle);
 
-    const cleanupTime = new Date();
-    cleanupTime.setHours(15);
-    cleanupTime.setMinutes(30);
+    // Schedule the close at exactly 15:30 ET (today)
+    const { hour, minute, second } = getEasternTimeParts();
+    const targetHour = PARAMS.CLOSING.HOURS;
+    const targetMinute = PARAMS.CLOSING.MINUTES;
+    const nowTotalSec = hour * 3600 + minute * 60 + second;
+    const targetTotalSec = targetHour * 3600 + targetMinute * 60;
+    const waitMs = Math.max(0, (targetTotalSec - nowTotalSec) * 1000);
 
     setTimeout(async () => {
         await request("positions", API.TRADE, {
@@ -107,13 +130,13 @@ async function cleanup() {
                 cancel_orders: true
             }
         });
-    }, cleanupTime.valueOf() - Date.now());
+    }, waitMs);
 }
 
 async function algo() {
-    //TODO: how to ensure Eastern Time??
-    const now = new Date();
-    if((now.getHours() === PARAMS.CLOSING.HOURS && now.getMinutes() + PARAMS.INTERVAL / 60 / 1000 >= PARAMS.CLOSING.MINUTES)) {
+    // Ensure Eastern Time for closing logic
+    const { hour: etHour, minute: etMinute } = getEasternTimeParts();
+    if (etHour === PARAMS.CLOSING.HOURS && etMinute + PARAMS.INTERVAL / 60 / 1000 >= PARAMS.CLOSING.MINUTES) {
         await cleanup();
     }
 
