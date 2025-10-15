@@ -70,6 +70,12 @@ function toDollars(x) {
     return Math.round(x * 100) / 100;
 }
 
+// Ensure only whole, positive quantities are used in orders
+function toWholeQty(x) {
+    const q = Math.floor(Number(x) || 0);
+    return Number.isFinite(q) && q > 0 ? q : 0;
+}
+
 async function noRatelimitRequest(path, type, options) {
     const res = await fetch(`https://${type}.${API.DOMAIN}/${path}?${new URLSearchParams(options.params).toString()}`, {
         method: options.method,
@@ -271,8 +277,8 @@ async function algo() {
                         notional = PARAMS.MAX_PER_DAY - moneySpent;
                     }
 
-                    // Convert to contracts (100x multiplier)
-                    const contractsQty = Math.floor(notional / (optAsk * 100));
+                    // Convert to contracts (100x multiplier) — enforce whole contracts
+                    const contractsQty = toWholeQty(notional / (optAsk * 100));
 
                     if (contractsQty > 0) {
                         // Buy option contracts (market)
@@ -419,8 +425,8 @@ async function algo() {
             notional = PARAMS.MAX_PER_DAY - moneySpent;
         }
 
-        //convert to shares
-        const qty = Math.floor(notional / stock.ask);
+        //convert to shares — enforce whole shares
+        const qty = toWholeQty(notional / stock.ask);
 
         //don't bother buying 0 shares :)
         //this, along with the if statement above, also implicitly ensures that we don't go over our spending limit
@@ -537,7 +543,7 @@ async function algo() {
                     cancelIfOpen(trailingStopOrder.id)
                 ]);
                 ocoResolved = true;
-                console.log(`Take-profit filled for ${stock.symbol}, stop-loss and trailing stop canceled.`);
+                console.log(`Take-profit filled for ${stock.symbol, stopLossOrder.id}, stop-loss and trailing stop canceled.`);
             } else if (
                 ["canceled", "expired"].includes(slStatus.status) &&
                 ["canceled", "expired"].includes(tsStatus.status) &&

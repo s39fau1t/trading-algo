@@ -25,4 +25,5 @@ Run:
 Notes:
 - The bot uses US/Eastern time and will attempt to close positions at the configured CLOSING time.
 - Ensure your account has sufficient buying power and that paper trading is enabled.
+- Equity orders are placed using whole-share quantities only (no fractional shares). Option orders are whole contracts.
 - Stop the program with Ctrl+C.
