@@ -1,0 +1,28 @@
+# Trading Algo — How to Run
+
+Prerequisites:
+- Node.js 18+ (required for global fetch and top‑level await)
+- An Alpaca Paper Trading account and API keys
+
+Setup:
+1. Clone the repo and open the project directory.
+2. (Optional) Replace the hardcoded API.KEY and API.SECRET in index.js with your own paper keys.
+3. Install dependencies (none required, but this ensures tooling is ready):
+   ```
+   npm install
+   ```
+
+Run:
+- Start the bot:
+  ```
+  npm start
+  ```
+  or
+  ```
+  node index.js
+  ```
+
+Notes:
+- The bot uses US/Eastern time and will attempt to close positions at the configured CLOSING time.
+- Ensure your account has sufficient buying power and that paper trading is enabled.
+- Stop the program with Ctrl+C.
