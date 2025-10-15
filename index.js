@@ -36,6 +36,8 @@ const PARAMS = {
     STOP_PRICE_MULT: 0.995,
     //Percent away from the highest water mark for trailing stop orders
     TRAILING_STOP_PERCENT: 1,
+    // Take profit percent above filled buy price (e.g., 5 = +5%)
+    TAKE_PROFIT_PERCENT: 5,
     //Time to cancel all orders and close out of all positions (24-hr, eastern time)
     CLOSING: {
         HOURS: 15,
@@ -305,8 +307,12 @@ async function algo() {
                         // Record spend
                         moneySpent += contractsQty * optAsk * 100;
 
+                        // Compute entry price and take profit for option (per-contract premium)
+                        const entryPriceOpt = parseFloat(buyOrderStatus.filled_avg_price || optAsk);
+                        const takeProfitPriceOpt = toDollars(entryPriceOpt * (1 + PARAMS.TAKE_PROFIT_PERCENT / 100));
+
                         // Place stop-loss sell (option)
-                        const stopLossPrice = Math.min(toDollars(optAsk * PARAMS.STOP_PRICE_MULT), optAsk - 0.01);
+                        const stopLossPrice = Math.min(toDollars(entryPriceOpt * PARAMS.STOP_PRICE_MULT), entryPriceOpt - 0.01);
                         const stopLossOrder = await request("orders", API.TRADE, {
                             method: "POST",
                             body: JSON.stringify({
@@ -334,20 +340,56 @@ async function algo() {
                             })
                         });
 
-                        // OCO monitor
+                        // Place take-profit limit sell (option)
+                        const takeProfitOrder = await request("orders", API.TRADE, {
+                            method: "POST",
+                            body: JSON.stringify({
+                                symbol: contract.symbol,
+                                asset_class: "option",
+                                qty: contractsQty,
+                                side: "sell",
+                                type: "limit",
+                                time_in_force: "gtc",
+                                limit_price: takeProfitPriceOpt
+                            })
+                        });
+
+                        // OCO monitor (three orders): cancel the other two when one fills
                         let ocoResolved = false;
                         while (!ocoResolved) {
-                            const [slStatus, tsStatus] = await Promise.all([
+                            const [slStatus, tsStatus, tpStatus] = await Promise.all([
                                 request(`orders/${stopLossOrder.id}`, API.TRADE),
-                                request(`orders/${trailingStopOrder.id}`, API.TRADE)
+                                request(`orders/${trailingStopOrder.id}`, API.TRADE),
+                                request(`orders/${takeProfitOrder.id}`, API.TRADE)
                             ]);
+
+                            const cancelIfOpen = async (id) => {
+                                try { await request(`orders/${id}`, API.TRADE, { method: "DELETE" }); } catch {}
+                            };
+
                             if (slStatus.status === "filled") {
-                                await request(`orders/${trailingStopOrder.id}`, API.TRADE, { method: "DELETE" });
+                                await Promise.all([
+                                    cancelIfOpen(trailingStopOrder.id),
+                                    cancelIfOpen(takeProfitOrder.id)
+                                ]);
                                 ocoResolved = true;
                             } else if (tsStatus.status === "filled") {
-                                await request(`orders/${stopLossOrder.id}`, API.TRADE, { method: "DELETE" });
+                                await Promise.all([
+                                    cancelIfOpen(stopLossOrder.id),
+                                    cancelIfOpen(takeProfitOrder.id)
+                                ]);
                                 ocoResolved = true;
-                            } else if (slStatus.status === "canceled" && tsStatus.status === "canceled") {
+                            } else if (tpStatus.status === "filled") {
+                                await Promise.all([
+                                    cancelIfOpen(stopLossOrder.id),
+                                    cancelIfOpen(trailingStopOrder.id)
+                                ]);
+                                ocoResolved = true;
+                            } else if (
+                                ["canceled", "expired"].includes(slStatus.status) &&
+                                ["canceled", "expired"].includes(tsStatus.status) &&
+                                ["canceled", "expired"].includes(tpStatus.status)
+                            ) {
                                 ocoResolved = true;
                             } else {
                                 await new Promise(res => setTimeout(res, 5000));
@@ -418,8 +460,12 @@ async function algo() {
             continue;
         }
 
+        // Compute entry price and take profit for stock
+        const entryPrice = parseFloat(buyOrderStatus.filled_avg_price || stock.ask);
+        const takeProfitPrice = toDollars(entryPrice * (1 + PARAMS.TAKE_PROFIT_PERCENT / 100));
+
         // Place stop-loss sell order
-        const stopLossPrice = Math.min(toDollars(stock.ask * PARAMS.STOP_PRICE_MULT), stock.ask - 0.01);
+        const stopLossPrice = Math.min(toDollars(entryPrice * PARAMS.STOP_PRICE_MULT), entryPrice - 0.01);
         const stopLossOrder = await request("orders", API.TRADE, {
             method: "POST",
             body: JSON.stringify({
@@ -445,24 +491,58 @@ async function algo() {
             })
         });
 
-        // OCO logic: monitor both sell orders, cancel the other when one fills
+        // Place take-profit limit sell order
+        const takeProfitOrder = await request("orders", API.TRADE, {
+            method: "POST",
+            body: JSON.stringify({
+                symbol: stock.symbol,
+                qty,
+                side: "sell",
+                type: "limit",
+                time_in_force: "gtc",
+                limit_price: takeProfitPrice
+            })
+        });
+
+        // OCO logic: monitor three sell orders, cancel the other two when one fills
         let ocoResolved = false;
         while (!ocoResolved) {
-            const [slStatus, tsStatus] = await Promise.all([
+            const [slStatus, tsStatus, tpStatus] = await Promise.all([
                 request(`orders/${stopLossOrder.id}`, API.TRADE),
-                request(`orders/${trailingStopOrder.id}`, API.TRADE)
+                request(`orders/${trailingStopOrder.id}`, API.TRADE),
+                request(`orders/${takeProfitOrder.id}`, API.TRADE)
             ]);
+
+            const cancelIfOpen = async (id) => {
+                try { await request(`orders/${id}`, API.TRADE, { method: "DELETE" }); } catch {}
+            };
+
             if (slStatus.status === "filled") {
-                // Cancel trailing stop order
-                await request(`orders/${trailingStopOrder.id}`, API.TRADE, { method: "DELETE" });
+                await Promise.all([
+                    cancelIfOpen(trailingStopOrder.id),
+                    cancelIfOpen(takeProfitOrder.id)
+                ]);
                 ocoResolved = true;
-                console.log(`Stop-loss filled for ${stock.symbol}, trailing stop canceled.`);
+                console.log(`Stop-loss filled for ${stock.symbol, trailingStopOrder.id}, trailing stop and take-profit canceled.`);
             } else if (tsStatus.status === "filled") {
-                // Cancel stop-loss order
-                await request(`orders/${stopLossOrder.id}`, API.TRADE, { method: "DELETE" });
+                await Promise.all([
+                    cancelIfOpen(stopLossOrder.id),
+                    cancelIfOpen(takeProfitOrder.id)
+                ]);
                 ocoResolved = true;
-                console.log(`Trailing stop filled for ${stock.symbol}, stop-loss canceled.`);
-            } else if (slStatus.status === "canceled" && tsStatus.status === "canceled") {
+                console.log(`Trailing stop filled for ${stock.symbol}, stop-loss and take-profit canceled.`);
+            } else if (tpStatus.status === "filled") {
+                await Promise.all([
+                    cancelIfOpen(stopLossOrder.id),
+                    cancelIfOpen(trailingStopOrder.id)
+                ]);
+                ocoResolved = true;
+                console.log(`Take-profit filled for ${stock.symbol}, stop-loss and trailing stop canceled.`);
+            } else if (
+                ["canceled", "expired"].includes(slStatus.status) &&
+                ["canceled", "expired"].includes(tsStatus.status) &&
+                ["canceled", "expired"].includes(tpStatus.status)
+            ) {
                 ocoResolved = true;
             } else {
                 await new Promise(res => setTimeout(res, 5000));
