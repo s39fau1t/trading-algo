@@ -186,40 +186,86 @@ async function algo() {
 
         //actual dollar amount we're buying now
         moneySpent += qty * stock.ask;
-//TODO
-        const res =  await request("orders", API.TRADE, {
+
+        // --- Custom Bracket Order with Stop Loss and Trailing Stop (OCO) ---
+        // Place market buy order
+        const buyOrder = await request("orders", API.TRADE, {
             method: "POST",
             body: JSON.stringify({
                 symbol: stock.symbol,
                 qty,
                 side: "buy",
                 type: "market",
-                time_in_force: "day",
-                order_class: "bracket",
-                take_profit : {
-                    limit_price: Math.max(toDollars(stock.ask * PARAMS.LIMIT_PRICE_MULT), stock.ask + 0.01) //TODO: stock.ask is not the price we always get in a market order
-                },
-                stop_loss: {
-                    stop_price: Math.min(toDollars(stock.ask * PARAMS.STOP_PRICE_MULT), stock.ask - 0.01)
-                }
+                time_in_force: "day"
             })
         });
 
-        console.log(res);
+        // Wait for the buy order to fill
+        let filled = false;
+        let buyOrderStatus;
+        for (let i = 0; i < 10; i++) {
+            buyOrderStatus = await request(`orders/${buyOrder.id}`, API.TRADE);
+            if (buyOrderStatus.status === "filled") {
+                filled = true;
+                break;
+            }
+            await new Promise(res => setTimeout(res, 2000));
+        }
+        if (!filled) {
+            console.log(`Buy order for ${stock.symbol} not filled in time, skipping OCO.`);
+            continue;
+        }
 
-        //no need to wait for a response to do the next order
-        await ratelimiter.consume();
-        noRatelimitRequest("orders", API.TRADE, {
+        // Place stop-loss sell order
+        const stopLossPrice = Math.min(toDollars(stock.ask * PARAMS.STOP_PRICE_MULT), stock.ask - 0.01);
+        const stopLossOrder = await request("orders", API.TRADE, {
+            method: "POST",
+            body: JSON.stringify({
+                symbol: stock.symbol,
+                qty,
+                side: "sell",
+                type: "stop",
+                time_in_force: "gtc",
+                stop_price: stopLossPrice
+            })
+        });
+
+        // Place trailing stop sell order
+        const trailingStopOrder = await request("orders", API.TRADE, {
             method: "POST",
             body: JSON.stringify({
                 symbol: stock.symbol,
                 qty,
                 side: "sell",
                 type: "trailing_stop",
-                time_in_force: "day",
+                time_in_force: "gtc",
                 trail_percent: PARAMS.TRAILING_STOP_PERCENT
             })
         });
+
+        // OCO logic: monitor both sell orders, cancel the other when one fills
+        let ocoResolved = false;
+        while (!ocoResolved) {
+            const [slStatus, tsStatus] = await Promise.all([
+                request(`orders/${stopLossOrder.id}`, API.TRADE),
+                request(`orders/${trailingStopOrder.id}`, API.TRADE)
+            ]);
+            if (slStatus.status === "filled") {
+                // Cancel trailing stop order
+                await request(`orders/${trailingStopOrder.id}`, API.TRADE, { method: "DELETE" });
+                ocoResolved = true;
+                console.log(`Stop-loss filled for ${stock.symbol}, trailing stop canceled.`);
+            } else if (tsStatus.status === "filled") {
+                // Cancel stop-loss order
+                await request(`orders/${stopLossOrder.id}`, API.TRADE, { method: "DELETE" });
+                ocoResolved = true;
+                console.log(`Trailing stop filled for ${stock.symbol}, stop-loss canceled.`);
+            } else if (slStatus.status === "canceled" && tsStatus.status === "canceled") {
+                ocoResolved = true;
+            } else {
+                await new Promise(res => setTimeout(res, 5000));
+            }
+        }
 
         //since we're only buying whole shares, this ensures the algo won't run infinetly doing nothing
         //we know we won't be able to buy any more shares anyway in this case, so just exit
