@@ -47,6 +47,73 @@ const PARAMS = {
 
 const ratelimiter = new Ratelimiter(RATELIMIT_MAX_REQ, RATELIMIT_TIMESPAN);
 
+// --- Logging helpers (ET timestamp) ---
+function etNow() {
+    return new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/New_York",
+        hour12: false,
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit"
+    }).format(new Date());
+}
+function log(...args) {
+    console.log(`[${etNow()} ET]`, ...args);
+}
+
+// --- Terminal countdown progress bar ---
+let handle; // reuses the existing handle variable for the progress timer
+let stopped = false;
+
+function formatDuration(ms) {
+    const sec = Math.max(0, Math.ceil(ms / 1000));
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    const two = (n) => String(n).padStart(2, "0");
+    return h > 0 ? `${two(h)}:${two(m)}:${two(s)}` : `${two(m)}:${two(s)}`;
+}
+
+function drawProgress(remaining, total, label = "Next run in") {
+    if (!process.stdout.isTTY) return;
+    const cols = process.stdout.columns || 80;
+    const barWidth = Math.max(10, Math.min(40, cols - 40));
+    const ratio = Math.max(0, Math.min(1, 1 - remaining / total));
+    const filled = Math.round(barWidth * ratio);
+    const bar = `[${"#".repeat(filled)}${"-".repeat(barWidth - filled)}] ${Math.round(ratio * 100)}% ${label} ${formatDuration(remaining)}`;
+    process.stdout.write("\r" + bar.padEnd(cols - 1));
+    if (remaining <= 0) process.stdout.write("\n");
+}
+
+function waitWithProgress(totalMs, label = "Next run in") {
+    return new Promise((resolve) => {
+        const start = Date.now();
+        clearInterval(handle);
+        handle = setInterval(() => {
+            const elapsed = Date.now() - start;
+            const remaining = Math.max(0, totalMs - elapsed);
+
+            if (stopped) {
+                clearInterval(handle);
+                if (process.stdout.isTTY) process.stdout.write("\n");
+                return resolve();
+            }
+
+            if (process.stdout.isTTY) {
+                drawProgress(remaining, totalMs, label);
+            } else if (elapsed === 0) {
+                log(label, formatDuration(totalMs));
+            }
+
+            if (remaining <= 0) {
+                clearInterval(handle);
+                if (process.stdout.isTTY) process.stdout.write("\n");
+                resolve();
+            }
+        }, 250);
+    });
+}
+
 // Helper: get Eastern Time parts (HH:mm:ss)
 function getEasternTimeParts(date = new Date()) {
     const parts = new Intl.DateTimeFormat("en-US", {
@@ -233,10 +300,11 @@ async function ensureDayState() {
     }
 }
 
-let handle, lastSnapshots;
+let lastSnapshots;
 
 async function cleanup() {
     clearInterval(handle);
+    stopped = true;
 
     // Schedule the close at exactly 15:30 ET (today)
     const { hour, minute, second } = getEasternTimeParts();
@@ -246,17 +314,23 @@ async function cleanup() {
     const targetTotalSec = targetHour * 3600 + targetMinute * 60;
     const waitMs = Math.max(0, (targetTotalSec - nowTotalSec) * 1000);
 
+    log("Cleanup scheduled. Will attempt to close all positions at", `${String(targetHour).padStart(2, "0")}:${String(targetMinute).padStart(2, "0")} ET`);
+
     setTimeout(async () => {
+        log("Closing all positions and canceling open orders...");
         await request("positions", API.TRADE, {
             method: "DELETE",
             params: {
                 cancel_orders: true
             }
         });
+        log("Close-out request sent.");
     }, waitMs);
 }
 
 async function algo() {
+    log("Iteration start");
+
     // Ensure Eastern Time for closing logic
     const { hour: etHour, minute: etMinute } = getEasternTimeParts();
     if (etHour === PARAMS.CLOSING.HOURS && etMinute + PARAMS.INTERVAL / 60 / 1000 >= PARAMS.CLOSING.MINUTES) {
@@ -300,6 +374,8 @@ async function algo() {
 
         return 0;
     });
+
+    log("Candidates:", stocks.length);
 
     const account = await request("account", API.TRADE);
     const equity = parseFloat(account.equity);
@@ -350,8 +426,11 @@ async function algo() {
 
                         // Skip if insufficient cash
                         if (notionalOpt > buyingPower) {
+                            log("Skip option (insufficient cash):", contract.symbol, "need", notionalOpt);
                             continue;
                         }
+
+                        log("Option BUY", contract.symbol, "qty", contractsQty, "ask", toDollars(optAsk));
 
                         // Place buy order (option)
                         const buyOrder = await request("orders", API.TRADE, {
@@ -378,7 +457,7 @@ async function algo() {
                             await new Promise(res => setTimeout(res, 2000));
                         }
                         if (!filled) {
-                            // If not filled, skip bracket creation and fall back to next stock
+                            log(`Option buy not filled in time: ${contract.symbol}`);
                             continue;
                         }
 
@@ -387,6 +466,7 @@ async function algo() {
 
                         // Compute entry price and take profit for option (per-contract premium)
                         const entryPriceOpt = parseFloat(buyOrderStatus.filled_avg_price || optAsk);
+                        log("Option FILLED", contract.symbol, "avg", toDollars(entryPriceOpt));
                         const takeProfitPriceOpt = toDollars(entryPriceOpt * (1 + PARAMS.TAKE_PROFIT_PERCENT / 100));
 
                         // Place stop-loss sell (option)
@@ -431,6 +511,8 @@ async function algo() {
                                 limit_price: takeProfitPriceOpt
                             })
                         });
+
+                        log("Option OCO placed", contract.symbol, "TP", takeProfitPriceOpt, "SL", Math.min(toDollars(entryPriceOpt * PARAMS.STOP_PRICE_MULT), entryPriceOpt - 0.01), "TR", `${PARAMS.TRAILING_STOP_PERCENT}%`);
 
                         // OCO monitor (three orders): cancel the other two when one fills
                         let ocoResolved = false;
@@ -506,6 +588,8 @@ async function algo() {
             continue;
         }
 
+        log("Equity BUY", stock.symbol, "qty", qty, "ask", toDollars(stock.ask));
+
         //actual dollar amount we're buying now
         moneySpent += qty * stock.ask;
 
@@ -534,12 +618,13 @@ async function algo() {
             await new Promise(res => setTimeout(res, 2000));
         }
         if (!filled) {
-            console.log(`Buy order for ${stock.symbol} not filled in time, skipping OCO.`);
+            log(`Equity buy not filled in time: ${stock.symbol}`);
             continue;
         }
 
         // Compute entry price and take profit for stock
         const entryPrice = parseFloat(buyOrderStatus.filled_avg_price || stock.ask);
+        log("Equity FILLED", stock.symbol, "avg", toDollars(entryPrice));
         const takeProfitPrice = toDollars(entryPrice * (1 + PARAMS.TAKE_PROFIT_PERCENT / 100));
 
         // Place stop-loss sell order
@@ -582,6 +667,8 @@ async function algo() {
             })
         });
 
+        log("Equity OCO placed", stock.symbol, "TP", takeProfitPrice, "SL", Math.min(toDollars(entryPrice * PARAMS.STOP_PRICE_MULT), entryPrice - 0.01), "TR", `${PARAMS.TRAILING_STOP_PERCENT}%`);
+
         // OCO logic: monitor three sell orders, cancel the other two when one fills
         let ocoResolved = false;
         while (!ocoResolved) {
@@ -601,7 +688,7 @@ async function algo() {
                     cancelIfOpen(takeProfitOrder.id)
                 ]);
                 ocoResolved = true;
-                console.log(`Stop-loss filled for ${stock.symbol, trailingStopOrder.id}, trailing stop and take-profit canceled.`);
+                console.log(`Stop-loss filled for ${stock.symbol}, trailing stop and take-profit canceled.`);
             } else if (tsStatus.status === "filled") {
                 await Promise.all([
                     cancelIfOpen(stopLossOrder.id),
@@ -615,7 +702,7 @@ async function algo() {
                     cancelIfOpen(trailingStopOrder.id)
                 ]);
                 ocoResolved = true;
-                console.log(`Take-profit filled for ${stock.symbol, stopLossOrder.id}, stop-loss and trailing stop canceled.`);
+                console.log(`Take-profit filled for ${stock.symbol}, stop-loss and trailing stop canceled.`);
             } else if (
                 ["canceled", "expired"].includes(slStatus.status) &&
                 ["canceled", "expired"].includes(tsStatus.status) &&
@@ -630,6 +717,7 @@ async function algo() {
         //since we're only buying whole shares, this ensures the algo won't run infinetly doing nothing
         //we know we won't be able to buy any more shares anyway in this case, so just exit
         if(moneySpent + PARAMS.MIN_PRICE > PARAMS.MAX_PER_DAY) {
+            log("Daily budget reached. Initiating cleanup...");
             break;
         }
     }
@@ -641,9 +729,22 @@ async function algo() {
     lastSnapshots = snapshots;
 }
 
-lastSnapshots = await getStocksSnapshots(symbols);
-
 // Initialize day state once at startup
 await ensureDayState();
+log("Initialized. Tradable NYSE symbols:", symbols.length);
 
-handle = setInterval(algo, PARAMS.INTERVAL);
+// --- Scheduler: run loop + countdown progress bar ---
+async function runLoop() {
+    while (!stopped) {
+        try {
+            await algo();
+        } catch (e) {
+            log("Iteration error:", e?.message || e);
+        }
+        if (!stopped) {
+            await waitWithProgress(PARAMS.INTERVAL);
+        }
+    }
+}
+
+runLoop();
