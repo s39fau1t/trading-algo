@@ -90,25 +90,46 @@ function toWholeQty(x) {
     return Number.isFinite(q) && q > 0 ? q : 0;
 }
 
+// Build URL safely; handle arrays as comma‑separated (e.g., symbols=AAPL,TSLA)
+function buildURL(type, path, params = {}) {
+    const url = new URL(`https://${type}.${API.DOMAIN}/${path}`);
+    const qp = new URLSearchParams();
+    for (const [k, v] of Object.entries(params || {})) {
+        if (v == null) continue;
+        if (Array.isArray(v)) {
+            qp.set(k, v.join(","));
+        } else {
+            qp.set(k, String(v));
+        }
+    }
+    const qs = qp.toString();
+    return qs ? `${url.href}?${qs}` : url.href;
+}
+
 async function noRatelimitRequest(path, type, options) {
-    const res = await fetch(`https://${type}.${API.DOMAIN}/${path}?${new URLSearchParams(options.params).toString()}`, {
+    const url = buildURL(type, path, options.params);
+    const res = await fetch(url, {
         method: options.method,
         headers: {
             accept: "application/json",
             "APCA-API-KEY-ID": API.KEY,
-            "APCA-API-SECRET-KEY": API.SECRET
+            "APCA-API-SECRET-KEY": API.SECRET,
+            ...(options.body ? { "content-type": "application/json" } : {})
         },
         body: options.body
     });
 
-    /*
-    TODO: look at these headers for possibly more efficient ratelimiting
-    console.log(res.headers.get("X-RateLimit-Limit"));
-    console.log(res.headers.get("X-RateLimit-Remaining"));
-    console.log(res.headers.get("X-RateLimit-Reset"));
-    */
+    // Robust response handling: surface non‑JSON bodies (e.g., HTML error pages)
+    const contentType = res.headers.get("content-type") || "";
+    const text = await res.text();
 
-    return await res.json();
+    if (!res.ok) {
+        throw new Error(`HTTP ${res.status} ${res.statusText} for ${url} -> ${text.slice(0,200)}`);
+    }
+    if (contentType.includes("application/json")) {
+        return JSON.parse(text);
+    }
+    throw new Error(`Non-JSON response from ${url}: ${text.slice(0,200)}`);
 }
 
 async function request(path, type, options = {
@@ -119,6 +140,21 @@ async function request(path, type, options = {
     await ratelimiter.consume();
 
     return await noRatelimitRequest(path, type, options);
+}
+
+// Normalize Market Data snapshots shape and batch large symbol lists to avoid URL limits
+function normalizeSnapshots(resp) {
+    return resp?.snapshots ?? resp ?? {};
+}
+
+async function getStocksSnapshots(allSymbols, batchSize = 200) {
+    const out = {};
+    for (let i = 0; i < allSymbols.length; i += batchSize) {
+        const batch = allSymbols.slice(i, i + batchSize);
+        const resp = await request("stocks/snapshots", API.DATA, { params: { symbols: batch } });
+        Object.assign(out, normalizeSnapshots(resp));
+    }
+    return out;
 }
 
 // Helpers for options trading
@@ -166,14 +202,20 @@ async function getNearestITMCallContract(underlying, targetPrice) {
     return candidates[0]; // has .symbol, .strike_price, .expiration_date
 }
 
-const assets = await request("assets", API.TRADE, {
+const assetsResp = await request("assets", API.TRADE, {
     params: {
         status: "active",
         asset_class: "us_equity"
     }
 });
-
-const symbols = assets.filter(asset => asset.tradable && (asset.exchange === "NYSE")).map(asset => asset.symbol);
+// Normalize possible response shapes into an array
+const assets = Array.isArray(assetsResp) ? assetsResp : (assetsResp?.assets || []);
+if (!Array.isArray(assets)) {
+    console.error("Unexpected /v2/assets response shape:", assetsResp);
+}
+const symbols = assets
+    .filter(asset => asset.tradable && (asset.exchange === "NYSE"))
+    .map(asset => asset.symbol);
 
 let moneySpent = 0;
 // New: track day + initial buying power (ET)
@@ -223,21 +265,18 @@ async function algo() {
 
     await ensureDayState();
 
-    const snapshots = await request("stocks/snapshots", API.DATA, {
-        params: {
-            symbols
-        }
-    });
+    const snapshots = await getStocksSnapshots(symbols);
 
     const stocks = [];
 
     for(const [symbol, snapshot] of Object.entries(snapshots)) {
         //sometimes minute bar or latest quote is not available
-        if(!snapshot.minuteBar || !snapshot.latestQuote) {
+        if(!snapshot?.minuteBar || !snapshot?.latestQuote) {
             continue;
         }
 
-        const lastAsk = lastSnapshots[symbol].latestQuote.ap;
+        const lastPrev = lastSnapshots?.[symbol];
+        const lastAsk = lastPrev?.latestQuote?.ap ?? 0;
 
         const ask = snapshot.latestQuote.ap;
         if(ask < PARAMS.MIN_PRICE || lastAsk === 0) {
@@ -602,11 +641,7 @@ async function algo() {
     lastSnapshots = snapshots;
 }
 
-lastSnapshots = await request("stocks/snapshots", API.DATA, {
-    params: {
-        symbols
-    }
-});
+lastSnapshots = await getStocksSnapshots(symbols);
 
 // Initialize day state once at startup
 await ensureDayState();
