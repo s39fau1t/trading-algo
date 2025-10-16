@@ -61,6 +61,9 @@ function log(...args) {
     console.log(`[${etNow()} ET]`, ...args);
 }
 
+// Add: runtime trading pause flag
+let tradingPaused = false;
+
 // --- Terminal countdown progress bar ---
 let handle; // reuses the existing handle variable for the progress timer
 let stopped = false;
@@ -328,6 +331,28 @@ async function cleanup() {
     }, waitMs);
 }
 
+// Add: flatten and cancel helper (close all positions, then cancel open orders)
+async function flattenAndCancel() {
+    try {
+        log("Flatten: closing all positions...");
+        await request("positions", API.TRADE, {
+            method: "DELETE",
+            params: { cancel_orders: false }
+        });
+    } catch (e) {
+        log("Flatten error:", e?.message || e);
+    }
+
+    try {
+        log("Cancel: canceling all open orders...");
+        await request("orders", API.TRADE, { method: "DELETE" });
+    } catch (e) {
+        log("Cancel error:", e?.message || e);
+    }
+
+    log("Flatten-and-cancel requests sent.");
+}
+
 async function algo() {
     log("Iteration start");
 
@@ -335,6 +360,12 @@ async function algo() {
     const { hour: etHour, minute: etMinute } = getEasternTimeParts();
     if (etHour === PARAMS.CLOSING.HOURS && etMinute + PARAMS.INTERVAL / 60 / 1000 >= PARAMS.CLOSING.MINUTES) {
         await cleanup();
+    }
+
+    // Guard: skip any new trades while paused
+    if (tradingPaused) {
+        log("Trading paused (dump it active). Skipping order placement.");
+        return;
     }
 
     await ensureDayState();
@@ -732,6 +763,29 @@ async function algo() {
 // Initialize day state once at startup
 await ensureDayState();
 log("Initialized. Tradable NYSE symbols:", symbols.length);
+
+// Add: stdin command handler ("dump it" / "pump it")
+process.stdin.setEncoding("utf8");
+process.stdin.resume();
+process.stdin.on("data", async (chunk) => {
+    for (const raw of chunk.split(/\r?\n/)) {
+        const line = raw.trim();
+        if (!line) continue;
+        const cmd = line.toLowerCase();
+
+        if (cmd === "dump it") {
+            tradingPaused = true; // immediately prevent new orders
+            log('Command: "dump it" received -> flattening and pausing trading.');
+            await flattenAndCancel();
+            log('Dump complete. Trading remains paused until "pump it".');
+        } else if (cmd === "pump it") {
+            tradingPaused = false;
+            log('Command: "pump it" received -> trading resumed (no positions reinstated).');
+        } else {
+            log("Unknown command:", line);
+        }
+    }
+});
 
 // --- Scheduler: run loop + countdown progress bar ---
 async function runLoop() {

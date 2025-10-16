@@ -22,6 +22,10 @@ Run:
   node index.js
   ```
 
+Interactive commands (type in the same terminal and press Enter):
+- "dump it": Immediately close all open positions, then cancel any remaining open orders, and pause new trades/orders. The program keeps running.
+- "pump it": Resume placing trades/orders. Previously closed positions are not reinstated.
+
 Notes:
 - The bot uses US/Eastern time and will attempt to close positions at the configured CLOSING time.
 - Ensure your account has sufficient buying power and that paper trading is enabled.
