@@ -331,6 +331,23 @@ async function cleanup() {
     }, waitMs);
 }
 
+// Add: wait helper to ensure positions are closed before canceling orders
+async function waitForPositionsClosed(timeoutMs = 120000, pollMs = 1500) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+        try {
+            const positions = await request("positions", API.TRADE);
+            if (!Array.isArray(positions) || positions.length === 0) {
+                return true;
+            }
+        } catch (e) {
+            // If the endpoint errors transiently, continue polling
+        }
+        await new Promise(res => setTimeout(res, pollMs));
+    }
+    return false;
+}
+
 // Add: flatten and cancel helper (close all positions, then cancel open orders)
 async function flattenAndCancel() {
     try {
@@ -339,18 +356,26 @@ async function flattenAndCancel() {
             method: "DELETE",
             params: { cancel_orders: false }
         });
+
+        // New: wait until all positions are closed before canceling orders
+        const closed = await waitForPositionsClosed();
+        if (closed) {
+            log("All positions closed.");
+        } else {
+            log("Timed out waiting for positions to close; proceeding to cancel open orders.");
+        }
     } catch (e) {
         log("Flatten error:", e?.message || e);
     }
 
     try {
-        log("Cancel: canceling all open orders...");
+        log("Cancel: canceling all remaining open orders...");
         await request("orders", API.TRADE, { method: "DELETE" });
     } catch (e) {
         log("Cancel error:", e?.message || e);
     }
 
-    log("Flatten-and-cancel requests sent.");
+    log("Flatten-and-cancel complete.");
 }
 
 async function algo() {
