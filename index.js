@@ -8,7 +8,7 @@ import Ratelimiter from "./ratelimiter.js";
 
 const API = Object.freeze({
     DOMAIN: "alpaca.markets/v2",
-    KEY: "PKF2GCQCPKEMJZFGOJ6JDHDOLOJC6PYE2D",
+    KEY: "PKEMJZFGOJ6JDHDOLOJC6PYE2D",
     SECRET: "GL3UD9kbckymMGBWF7cHvniPo8RFgENrE33BpZJWtVHz",
     TRADE: "paper-api",
     DATA: "data"
