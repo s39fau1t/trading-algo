@@ -243,7 +243,12 @@ async function getStocksSnapshots(allSymbols, batchSize = 200) {
     const out = {};
     for (let i = 0; i < allSymbols.length; i += batchSize) {
         const batch = allSymbols.slice(i, i + batchSize);
-        const resp = await request("stocks/snapshots", API.DATA, { params: { symbols: batch } });
+        const resp = await request("stocks/snapshots", API.DATA, {
+            params: {
+                symbols: batch,
+                feed: "iex" // use IEX to avoid recent SIP restriction
+            }
+        });
         Object.assign(out, normalizeSnapshots(resp));
     }
     return out;
@@ -266,7 +271,8 @@ async function getClosePriceMinutesAgo(symbols, minutesAgo = 10, batchSize = 200
                 symbols: batch,
                 timeframe: "1Min",
                 start,
-                end
+                end,
+                feed: "iex" // use IEX to avoid recent SIP restriction
             }
         });
 
