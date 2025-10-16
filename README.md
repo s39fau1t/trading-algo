@@ -27,6 +27,8 @@ Interactive commands (type in the same terminal and press Enter):
 - "pump it": Resume placing trades/orders. Previously closed positions are not reinstated.
 
 Notes:
+- The bot computes % change using historical 1‑minute bars from 10 minutes ago (configurable via PARAMS.LOOKBACK_MINUTES) against the current ask, so it can evaluate and trade every minute without waiting 10 minutes between iterations.
+- Default iteration interval is 60 seconds (PARAMS.INTERVAL). Adjust if needed based on your API subscription and rate limits.
 - The bot uses US/Eastern time and will attempt to close positions at the configured CLOSING time.
 - Ensure your account has sufficient buying power and that paper trading is enabled.
 - Equity orders are placed using whole-share quantities only (no fractional shares). Option orders are whole contracts.

@@ -19,7 +19,7 @@ const RATELIMIT_TIMESPAN = 1 * 60 * 1000;
 
 const PARAMS = {
     //Interval between each iteration of the algo (ms)
-    INTERVAL: 10 * 60 * 1000,
+    INTERVAL: 60 * 1000,
     //Max money spent per day (dollars)
     MAX_PER_DAY: 2000,
     //Minimum price of a stock before consider buying it (dollars)
@@ -42,7 +42,9 @@ const PARAMS = {
     CLOSING: {
         HOURS: 15,
         MINUTES: 30
-    }
+    },
+    // Minutes to look back for historical price comparison
+    LOOKBACK_MINUTES: 10
 };
 
 const ratelimiter = new Ratelimiter(RATELIMIT_MAX_REQ, RATELIMIT_TIMESPAN);
@@ -217,12 +219,78 @@ function normalizeSnapshots(resp) {
     return resp?.snapshots ?? resp ?? {};
 }
 
+// New: normalize bars response into a { [symbol]: Bar[] } map
+function normalizeBarsMap(resp) {
+    const out = {};
+    if (!resp) return out;
+
+    // Case 1: resp.bars is an object keyed by symbol
+    if (resp.bars && typeof resp.bars === "object" && !Array.isArray(resp.bars)) {
+        return resp.bars;
+    }
+
+    // Case 2: resp.bars is an array of bars with symbol field (S or symbol)
+    const arr = Array.isArray(resp.bars) ? resp.bars : (Array.isArray(resp) ? resp : []);
+    for (const b of arr) {
+        const sym = b?.S || b?.symbol;
+        if (!sym) continue;
+        (out[sym] = out[sym] || []).push(b);
+    }
+    return out;
+}
+
 async function getStocksSnapshots(allSymbols, batchSize = 200) {
     const out = {};
     for (let i = 0; i < allSymbols.length; i += batchSize) {
         const batch = allSymbols.slice(i, i + batchSize);
         const resp = await request("stocks/snapshots", API.DATA, { params: { symbols: batch } });
         Object.assign(out, normalizeSnapshots(resp));
+    }
+    return out;
+}
+
+// New: fetch close price approximately LOOKBACK_MINUTES ago per symbol
+async function getClosePriceMinutesAgo(symbols, minutesAgo = 10, batchSize = 200) {
+    const out = {};
+    if (!symbols.length) return out;
+
+    const target = Date.now() - minutesAgo * 60 * 1000;
+    // Search a small window around target minute to be robust
+    const start = new Date(target - 60 * 1000).toISOString();
+    const end = new Date(target + 60 * 1000).toISOString();
+
+    for (let i = 0; i < symbols.length; i += batchSize) {
+        const batch = symbols.slice(i, i + batchSize);
+        const resp = await request("stocks/bars", API.DATA, {
+            params: {
+                symbols: batch,
+                timeframe: "1Min",
+                start,
+                end
+            }
+        });
+
+        const barsMap = normalizeBarsMap(resp);
+        for (const sym of batch) {
+            const bars = barsMap[sym] || [];
+            if (!bars.length) continue;
+
+            // Pick the bar closest to target time
+            let best = null;
+            let bestDiff = Infinity;
+            for (const b of bars) {
+                const ts = Date.parse(b.t || b.time || b.Timestamp || b.ts || b.T || "");
+                if (!Number.isFinite(ts)) continue;
+                const diff = Math.abs(ts - target);
+                if (diff < bestDiff) {
+                    best = b;
+                    bestDiff = diff;
+                }
+            }
+            if (best && best.c != null) {
+                out[sym] = Number(best.c);
+            }
+        }
     }
     return out;
 }
@@ -302,8 +370,6 @@ async function ensureDayState() {
         moneySpent = 0;
     }
 }
-
-let lastSnapshots;
 
 async function cleanup() {
     clearInterval(handle);
@@ -397,39 +463,35 @@ async function algo() {
 
     const snapshots = await getStocksSnapshots(symbols);
 
-    const stocks = [];
-
-    for(const [symbol, snapshot] of Object.entries(snapshots)) {
-        //sometimes minute bar or latest quote is not available
-        if(!snapshot?.minuteBar || !snapshot?.latestQuote) {
-            continue;
-        }
-
-        const lastPrev = lastSnapshots?.[symbol];
-        const lastAsk = lastPrev?.latestQuote?.ap ?? 0;
-
+    // Pre-filter viable symbols and gather for historical lookup
+    const viableSymbols = [];
+    for (const [symbol, snapshot] of Object.entries(snapshots)) {
+        if (!snapshot?.minuteBar || !snapshot?.latestQuote) continue;
         const ask = snapshot.latestQuote.ap;
-        if(ask < PARAMS.MIN_PRICE || lastAsk === 0) {
-            continue;
-        }
+        if (ask < PARAMS.MIN_PRICE) continue;
+        viableSymbols.push(symbol);
+    }
+
+    // Fetch prices ~LOOKBACK_MINUTES ago only for viable symbols
+    const price10mAgo = await getClosePriceMinutesAgo(viableSymbols, PARAMS.LOOKBACK_MINUTES);
+
+    const stocks = [];
+    for (const symbol of viableSymbols) {
+        const snapshot = snapshots[symbol];
+        const ask = snapshot.latestQuote.ap;
+        const prev = price10mAgo[symbol];
+
+        if (!prev || prev <= 0) continue;
 
         stocks.push({
             symbol,
             ask,
             volume: snapshot.minuteBar.v,
-            change: (ask - lastAsk) / lastAsk
+            change: (ask - prev) / prev
         });
     }
 
-    stocks.sort((a, b) => {
-        if(a.change > b.change) {
-            return -1;
-        }else if(a.change < b.change) {
-            return 1;
-        }
-
-        return 0;
-    });
+    stocks.sort((a, b) => b.change - a.change);
 
     log("Candidates:", stocks.length);
 
@@ -781,8 +843,6 @@ async function algo() {
     if(moneySpent + PARAMS.MIN_PRICE > PARAMS.MAX_PER_DAY) {
         await cleanup();
     }
-
-    lastSnapshots = snapshots;
 }
 
 // Initialize day state once at startup
