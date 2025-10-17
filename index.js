@@ -65,6 +65,8 @@ function log(...args) {
 
 // Add: runtime trading pause flag
 let tradingPaused = false;
+// Add: automatic off-hours guard (3:30 PM -> 9:40 AM ET)
+let offHoursActive = false;
 
 // --- Terminal countdown progress bar ---
 let handle; // reuses the existing handle variable for the progress timer
@@ -155,6 +157,17 @@ function getETDateKey(date = new Date()) {
 // New: compute regular trading start minutes in ET (market open 09:30 + LOOKBACK_MINUTES)
 function getTradingStartMinutesET() {
     return 9 * 60 + 30 + (PARAMS.LOOKBACK_MINUTES || 10);
+}
+
+// New: closing minutes constant
+const CLOSING_MINUTES_ET = PARAMS.CLOSING.HOURS * 60 + PARAMS.CLOSING.MINUTES;
+
+// New: are we outside the trading window? (after 15:30 or before 9:40 ET)
+function isOffHoursET() {
+    const { hour, minute } = getEasternTimeParts();
+    const mins = hour * 60 + minute;
+    const startMins = getTradingStartMinutesET();
+    return mins >= CLOSING_MINUTES_ET || mins < startMins;
 }
 
 // New: format minutes since midnight as HH:MM for logs
@@ -392,27 +405,20 @@ async function ensureDayState() {
 
 async function cleanup() {
     clearInterval(handle);
-    stopped = true;
-
-    // Schedule the close at exactly 15:30 ET (today)
+    // Do NOT stop the loop; we keep enforcing off-hours flat state
     const { hour, minute, second } = getEasternTimeParts();
-    const targetHour = PARAMS.CLOSING.HOURS;
-    const targetMinute = PARAMS.CLOSING.MINUTES;
     const nowTotalSec = hour * 3600 + minute * 60 + second;
-    const targetTotalSec = targetHour * 3600 + targetMinute * 60;
+    const targetTotalSec = CLOSING_MINUTES_ET * 60;
     const waitMs = Math.max(0, (targetTotalSec - nowTotalSec) * 1000);
 
-    log("Cleanup scheduled. Will attempt to close all positions at", `${String(targetHour).padStart(2, "0")}:${String(targetMinute).padStart(2, "0")} ET`);
+    log("Cleanup scheduled. Will flatten (positions first, then orders) at", `${String(PARAMS.CLOSING.HOURS).padStart(2, "0")}:${String(PARAMS.CLOSING.MINUTES).padStart(2, "0")} ET`);
 
     setTimeout(async () => {
-        log("Closing all positions and canceling open orders...");
-        await request("positions", API.TRADE, {
-            method: "DELETE",
-            params: {
-                cancel_orders: true
-            }
-        });
-        log("Close-out request sent.");
+        log("3:30 PM ET reached: flattening positions before canceling any open orders...");
+        await flattenAndCancel();
+        offHoursActive = true;
+        tradingPaused = true; // remain paused until 9:40 AM ET
+        log("Off-hours engaged. No positions or open orders will be allowed until market re-opens window.");
     }, waitMs);
 }
 
@@ -433,6 +439,23 @@ async function waitForPositionsClosed(timeoutMs = 120000, pollMs = 1500) {
     return false;
 }
 
+// Add: wait until there are no open orders
+async function waitForNoOpenOrders(timeoutMs = 120000, pollMs = 1500) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+        try {
+            const openOrders = await request("orders", API.TRADE, { params: { status: "open" } });
+            if (!Array.isArray(openOrders) || openOrders.length === 0) {
+                return true;
+            }
+        } catch (e) {
+            // transient, continue
+        }
+        await new Promise(res => setTimeout(res, pollMs));
+    }
+    return false;
+}
+
 // Add: flatten and cancel helper (close all positions, then cancel open orders)
 async function flattenAndCancel() {
     try {
@@ -442,7 +465,7 @@ async function flattenAndCancel() {
             params: { cancel_orders: false }
         });
 
-        // New: wait until all positions are closed before canceling orders
+        // Wait until all positions are closed before canceling orders
         const closed = await waitForPositionsClosed();
         if (closed) {
             log("All positions closed.");
@@ -456,6 +479,8 @@ async function flattenAndCancel() {
     try {
         log("Cancel: canceling all remaining open orders...");
         await request("orders", API.TRADE, { method: "DELETE" });
+        await waitForNoOpenOrders();
+        log("All open orders canceled.");
     } catch (e) {
         log("Cancel error:", e?.message || e);
     }
@@ -465,6 +490,11 @@ async function flattenAndCancel() {
 
 async function algo() {
     log("Iteration start");
+
+    // Enforce no trading/no orders/no positions during off-hours (15:30 -> 09:40 ET)
+    if (await enforceOffHours()) {
+        return;
+    }
 
     // Ensure Eastern Time for closing logic
     const { hour: etHour, minute: etMinute } = getEasternTimeParts();
