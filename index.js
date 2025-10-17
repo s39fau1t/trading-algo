@@ -152,6 +152,19 @@ function getETDateKey(date = new Date()) {
     return `${parts.year}-${parts.month}-${parts.day}`;
 }
 
+// New: compute regular trading start minutes in ET (market open 09:30 + LOOKBACK_MINUTES)
+function getTradingStartMinutesET() {
+    return 9 * 60 + 30 + (PARAMS.LOOKBACK_MINUTES || 10);
+}
+
+// New: format minutes since midnight as HH:MM for logs
+function formatMinutesAsHHMM(mins) {
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    const two = (n) => String(n).padStart(2, "0");
+    return `${two(h)}:${two(m)}`;
+}
+
 function toDollars(x) {
     return Math.round(x * 100) / 100;
 }
@@ -457,6 +470,14 @@ async function algo() {
     const { hour: etHour, minute: etMinute } = getEasternTimeParts();
     if (etHour === PARAMS.CLOSING.HOURS && etMinute + PARAMS.INTERVAL / 60 / 1000 >= PARAMS.CLOSING.MINUTES) {
         await cleanup();
+    }
+
+    // Gate: do not place trades before market open + LOOKBACK_MINUTES (e.g., 09:40 ET by default)
+    const nowMins = etHour * 60 + etMinute;
+    const startMins = getTradingStartMinutesET();
+    if (nowMins < startMins) {
+        log(`Pre-market window: trading begins at ${formatMinutesAsHHMM(startMins)} ET. Skipping orders this iteration.`);
+        return;
     }
 
     // Guard: skip any new trades while paused
