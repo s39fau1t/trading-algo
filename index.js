@@ -19,7 +19,7 @@ const RATELIMIT_TIMESPAN = 1 * 60 * 1000;
 
 const PARAMS = {
     //Interval between each iteration of the algo (ms)
-    INTERVAL: 60 * 1000,
+    INTERVAL: 30 * 1000,
     //Max money spent per day (dollars)
     MAX_PER_DAY: 2000,
     //Minimum price of a stock before consider buying it (dollars)
