@@ -647,7 +647,7 @@ async function algo() {
 
     // Guard: skip any new trades while paused
     if (tradingPaused) {
-        log("Trading paused (dump it active). Skipping order placement.");
+        log("Trading paused (dump active). Skipping order placement.");
         return;
     }
 
@@ -880,14 +880,14 @@ rl.on("line", async (raw) => {
     }
     const cmd = line.toLowerCase();
 
-    if (cmd === "dump it") {
+    if (cmd === "dump") {
         tradingPaused = true; // immediately prevent new orders
-        log('Command: "dump it" received -> flattening and pausing trading.');
+        log('Command: "dump" received -> flattening and pausing trading.');
         await flattenAndCancel();
-        log('Dump complete. Trading remains paused until "pump it".');
-    } else if (cmd === "pump it") {
+        log('Dump complete. Trading remains paused until "pump".');
+    } else if (cmd === "pump") {
         tradingPaused = false;
-        log('Command: "pump it" received -> trading resumed (no positions reinstated).');
+        log('Command: "pump" received -> trading resumed (no positions reinstated).');
     } else {
         log("Unknown command:", line);
     }

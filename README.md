@@ -23,8 +23,8 @@ Run:
   ```
 
 Interactive commands (type in the same terminal and press Enter):
-- "dump it": Immediately close all open positions, then cancel any remaining open orders, and pause new trades/orders. The program keeps running.
-- "pump it": Resume placing trades/orders. Previously closed positions are not reinstated.
+- "dump": Immediately close all open positions, then cancel any remaining open orders, and pause new trades/orders. The program keeps running.
+- "pump": Resume placing trades/orders. Previously closed positions are not reinstated.
 
 Notes:
 - The bot only begins placing trades from 9:40 AM ET (market open + LOOKBACK_MINUTES). If you adjust LOOKBACK_MINUTES, the start time shifts accordingly.
@@ -35,5 +35,5 @@ Notes:
 - The bot uses US/Eastern time and will attempt to close positions at the configured CLOSING time.
 - Ensure your account has sufficient buying power and that paper trading is enabled.
 - Equity orders are placed using whole-share quantities only (no fractional shares). Option orders are whole contracts.
-- "pump it" cannot override the off-hours restriction; trading resumes automatically at 9:40 AM ET if not paused manually.
+- "pump" cannot override the off-hours restriction; trading resumes automatically at 9:40 AM ET if not paused manually.
 - Stop the program with Ctrl+C.
