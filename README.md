@@ -27,13 +27,33 @@ Interactive commands (type in the same terminal and press Enter):
 - "pump": Resume placing trades/orders. Previously closed positions are not reinstated.
 
 Notes:
-- The bot only begins placing trades from 9:40 AM ET (market open + LOOKBACK_MINUTES). If you adjust LOOKBACK_MINUTES, the start time shifts accordingly.
-- From 3:30 PM ET until 9:40 AM ET the next trading day, the bot enforces an off-hours state: it closes all positions first and only then cancels any remaining open orders. During this window, no positions or open orders are allowed, and no new trades are placed.
-- Each iteration can place multiple trades across the top-ranked symbols. Combined notional for that iteration is capped by remaining initial day buying power minus $5, while still respecting per-symbol exposure, per-trade limits, and the daily MAX_PER_DAY cap.
-- The bot computes % change using historical 1‑minute bars from 10 minutes ago (configurable via PARAMS.LOOKBACK_MINUTES) against the current ask, so it can evaluate and trade every minute without waiting 10 minutes between iterations.
-- Default iteration interval is 30 seconds (PARAMS.INTERVAL). Adjust if needed based on your API subscription and rate limits.
-- The bot uses US/Eastern time and will attempt to close positions at the configured CLOSING time.
+- Trading window: The bot only begins placing trades from market open + LOOKBACK_MINUTES (default 9:30 AM ET + 10 min = 9:40 AM ET). If you adjust LOOKBACK_MINUTES, the start time shifts accordingly.
+- Off-hours enforcement: From 3:30 PM ET until the next 9:40 AM ET, the bot enforces a flat state:
+  - All positions are closed first, then any remaining open orders are canceled.
+  - No positions or open orders are allowed and no new trades are placed.
+  - Trading auto-resumes at 9:40 AM ET unless you manually paused it; "pump" cannot override the off-hours restriction.
+- Option-first strategy with custom exits:
+  - For each candidate symbol, the bot first attempts to buy the nearest-expiry ITM call contract (strike <= target) sized by available per-trade budget. If it can’t, it falls back to equity shares.
+  - After a buy fills, it immediately places three exit legs:
+    - Stop loss: stop order at STOP_PRICE_MULT of filled price.
+    - Trailing stop: trailing_stop with TRAILING_STOP_PERCENT.
+    - Take profit: limit order at TAKE_PROFIT_PERCENT above entry.
+  - A background monitor cancels the two sibling exits when one exit fills (OCO-like behavior). Trailing stop placement is retried to improve reliability.
+- Exposure and sizing:
+  - Per-symbol exposure cap (MAX_PERCENTAGE_PER_STOCK of equity) is computed by underlying and includes both equity and options market value.
+  - Per-iteration and per-trade budgets respect:
+    - Initial day buying power snapshot (resets on ET date change),
+    - Daily cap MAX_PER_DAY,
+    - Liquidity cap based on minute volume and price (SPEND_MULT),
+    - MAX_BUYING_POWER_AT_ONCE applied to both initial and current buying power.
+  - Quantities are whole numbers only (whole shares, whole option contracts).
+- Data feed and lookback:
+  - Uses IEX feed for snapshots and 1-minute bars to avoid SIP restrictions.
+  - Percent change is computed from the current ask versus a bar approximately LOOKBACK_MINUTES ago, allowing frequent iterations without waiting.
+- Timing and scheduling:
+  - Uses US/Eastern time for all scheduling.
+  - A cleanup scheduler targets 3:30 PM ET; enforceOffHours also runs each iteration to ensure the account remains flat during off-hours.
+  - Default iteration interval is 30 seconds (PARAMS.INTERVAL). A simple countdown is shown; in interactive mode the display avoids overwriting your input.
+- Rate limiting: A simple token bucket (200 req/min) throttles all API calls.
 - Ensure your account has sufficient buying power and that paper trading is enabled.
-- Equity orders are placed using whole-share quantities only (no fractional shares). Option orders are whole contracts.
-- "pump" cannot override the off-hours restriction; trading resumes automatically at 9:40 AM ET if not paused manually.
 - Stop the program with Ctrl+C.
