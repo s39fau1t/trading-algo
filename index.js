@@ -526,6 +526,82 @@ async function monitorOCO(stopLossOrderId, trailingStopOrderId, takeProfitOrderI
     }
 }
 
+// Add: place order with retries (used to ensure trailing stop gets placed)
+async function placeOrderWithRetry(body, retries = 3, delayMs = 1500) {
+    let lastErr;
+    for (let i = 0; i <= retries; i++) {
+        try {
+            return await request("orders", API.TRADE, {
+                method: "POST",
+                body: JSON.stringify(body)
+            });
+        } catch (e) {
+            lastErr = e;
+            if (i < retries) {
+                await new Promise(res => setTimeout(res, delayMs));
+            }
+        }
+    }
+    throw lastErr || new Error("Failed to place order after retries");
+}
+
+// Add: helper to build order body (conditionally add asset_class for options)
+function buildOrderBody({ symbol, qty, side, type, tif = "gtc", assetClass, extra = {} }) {
+    const body = { symbol, qty, side, type, time_in_force: tif, ...extra };
+    if (assetClass === "option") body.asset_class = "option";
+    return body;
+}
+
+// Add: ensure custom bracket legs (stop loss + trailing stop + take profit) are all placed.
+// If trailing stop cannot be placed, cancel any created legs and throw.
+async function placeCustomBracketOrders({ symbol, qty, assetClass, entryPrice }) {
+    const takeProfitPrice = toDollars(entryPrice * (1 + PARAMS.TAKE_PROFIT_PERCENT / 100));
+    const stopLossPrice = Math.min(toDollars(entryPrice * PARAMS.STOP_PRICE_MULT), entryPrice - 0.01);
+
+    let stopLossOrder, trailingStopOrder, takeProfitOrder;
+    try {
+        stopLossOrder = await placeOrderWithRetry(
+            buildOrderBody({
+                symbol, qty, side: "sell", type: "stop", assetClass,
+                extra: { stop_price: stopLossPrice }
+            })
+        );
+
+        // Emphasize reliability for trailing stop leg
+        trailingStopOrder = await placeOrderWithRetry(
+            buildOrderBody({
+                symbol, qty, side: "sell", type: "trailing_stop", assetClass,
+                extra: { trail_percent: PARAMS.TRAILING_STOP_PERCENT }
+            }),
+            4 // extra retry for the trailing leg
+        );
+
+        takeProfitOrder = await placeOrderWithRetry(
+            buildOrderBody({
+                symbol, qty, side: "sell", type: "limit", assetClass,
+                extra: { limit_price: takeProfitPrice }
+            })
+        );
+
+        if (!trailingStopOrder?.id) {
+            throw new Error("Trailing stop placement failed");
+        }
+    } catch (e) {
+        // Cancel any legs that might have been created to avoid dangling exits
+        const ids = [stopLossOrder?.id, trailingStopOrder?.id, takeProfitOrder?.id].filter(Boolean);
+        await Promise.all(ids.map(id =>
+            request(`orders/${id}`, API.TRADE, { method: "DELETE" }).catch(() => {})
+        ));
+        throw e;
+    }
+
+    return {
+        stopLossOrderId: stopLossOrder.id,
+        trailingStopOrderId: trailingStopOrder.id,
+        takeProfitOrderId: takeProfitOrder.id
+    };
+}
+
 async function algo() {
     log("Iteration start");
 
@@ -680,7 +756,6 @@ async function algo() {
                         if (!filled) {
                             log(`Option buy not filled in time: ${contract.symbol}`);
                         } else {
-                            // Actual spend and risk tracking
                             const entryPriceOpt = parseFloat(buyOrderStatus.filled_avg_price || optAsk);
                             const notionalOpt = toDollars(contractsQty * entryPriceOpt * 100);
 
@@ -688,49 +763,16 @@ async function algo() {
                             moneySpent += notionalOpt;
                             pendingExposureByUnderlying[underlying] = (pendingExposureByUnderlying[underlying] || 0) + notionalOpt;
 
-                            // Place exits
-                            const takeProfitPriceOpt = toDollars(entryPriceOpt * (1 + PARAMS.TAKE_PROFIT_PERCENT / 100));
-                            const stopLossPrice = Math.min(toDollars(entryPriceOpt * PARAMS.STOP_PRICE_MULT), entryPriceOpt - 0.01);
-
-                            const stopLossOrder = await request("orders", API.TRADE, {
-                                method: "POST",
-                                body: JSON.stringify({
-                                    symbol: contract.symbol,
-                                    asset_class: "option",
-                                    qty: contractsQty,
-                                    side: "sell",
-                                    type: "stop",
-                                    time_in_force: "gtc",
-                                    stop_price: stopLossPrice
-                                })
-                            });
-                            const trailingStopOrder = await request("orders", API.TRADE, {
-                                method: "POST",
-                                body: JSON.stringify({
-                                    symbol: contract.symbol,
-                                    asset_class: "option",
-                                    qty: contractsQty,
-                                    side: "sell",
-                                    type: "trailing_stop",
-                                    time_in_force: "gtc",
-                                    trail_percent: PARAMS.TRAILING_STOP_PERCENT
-                                })
-                            });
-                            const takeProfitOrder = await request("orders", API.TRADE, {
-                                method: "POST",
-                                body: JSON.stringify({
-                                    symbol: contract.symbol,
-                                    asset_class: "option",
-                                    qty: contractsQty,
-                                    side: "sell",
-                                    type: "limit",
-                                    time_in_force: "gtc",
-                                    limit_price: takeProfitPriceOpt
-                                })
+                            // Place mandatory custom bracket exits (includes trailing stop with retries)
+                            const exits = await placeCustomBracketOrders({
+                                symbol: contract.symbol,
+                                qty: contractsQty,
+                                assetClass: "option",
+                                entryPrice: entryPriceOpt
                             });
 
                             // Fire-and-forget OCO monitoring
-                            monitorOCO(stopLossOrder.id, trailingStopOrder.id, takeProfitOrder.id).catch(() => {});
+                            monitorOCO(exits.stopLossOrderId, exits.trailingStopOrderId, exits.takeProfitOrderId).catch(() => {});
                             log("Option BUY", contract.symbol, "qty", contractsQty, "avg", toDollars(entryPriceOpt));
                             traded = true;
                         }
@@ -771,52 +813,21 @@ async function algo() {
             continue;
         }
 
-        // Compute entry price and update budgets/exposure
         const entryPrice = parseFloat(buyOrderStatus.filled_avg_price || stock.ask);
         const notional = toDollars(qty * entryPrice);
         moneySpent += notional;
         pendingExposureByUnderlying[underlying] = (pendingExposureByUnderlying[underlying] || 0) + notional;
 
-        // Place exits
-        const takeProfitPrice = toDollars(entryPrice * (1 + PARAMS.TAKE_PROFIT_PERCENT / 100));
-        const stopLossPrice = Math.min(toDollars(entryPrice * PARAMS.STOP_PRICE_MULT), entryPrice - 0.01);
-
-        const stopLossOrder = await request("orders", API.TRADE, {
-            method: "POST",
-            body: JSON.stringify({
-                symbol: stock.symbol,
-                qty,
-                side: "sell",
-                type: "stop",
-                time_in_force: "gtc",
-                stop_price: stopLossPrice
-            })
-        });
-        const trailingStopOrder = await request("orders", API.TRADE, {
-            method: "POST",
-            body: JSON.stringify({
-                symbol: stock.symbol,
-                qty,
-                side: "sell",
-                type: "trailing_stop",
-                time_in_force: "gtc",
-                trail_percent: PARAMS.TRAILING_STOP_PERCENT
-            })
-        });
-        const takeProfitOrder = await request("orders", API.TRADE, {
-            method: "POST",
-            body: JSON.stringify({
-                symbol: stock.symbol,
-                qty,
-                side: "sell",
-                type: "limit",
-                time_in_force: "gtc",
-                limit_price: takeProfitPrice
-            })
+        // Place mandatory custom bracket exits (includes trailing stop with retries)
+        const exits = await placeCustomBracketOrders({
+            symbol: stock.symbol,
+            qty,
+            assetClass: undefined,
+            entryPrice
         });
 
         // Fire-and-forget OCO monitoring
-        monitorOCO(stopLossOrder.id, trailingStopOrder.id, takeProfitOrder.id).catch(() => {});
+        monitorOCO(exits.stopLossOrderId, exits.trailingStopOrderId, exits.takeProfitOrderId).catch(() => {});
         log("Equity BUY", stock.symbol, "qty", qty, "avg", toDollars(entryPrice));
 
         // Guard: stop if we have no budget left for at least one more min trade
