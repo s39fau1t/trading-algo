@@ -414,6 +414,8 @@ let moneySpent = 0;
 // New: track day + initial buying power (ET)
 let initialBuyingPower = 0;
 let currentDayKey = null;
+// Add: track traded symbols per day
+let tradedSymbolsToday = new Set();
 
 // New: ensure day state (reset on ET date change)
 async function ensureDayState() {
@@ -423,6 +425,7 @@ async function ensureDayState() {
         initialBuyingPower = parseFloat(account.cash || "0");
         currentDayKey = dayKey;
         moneySpent = 0;
+        tradedSymbolsToday.clear(); // Reset traded symbols on new day
     }
 }
 
@@ -758,6 +761,9 @@ async function algo() {
         dailyRemainingNow = toDollars(Math.max(0, PARAMS.MAX_PER_DAY - moneySpent));
         if (remainingAlloc < PARAMS.MIN_PRICE || dailyRemainingNow < PARAMS.MIN_PRICE) break;
 
+        // Skip if we already traded this symbol today
+        if (tradedSymbolsToday.has(stock.symbol)) continue;
+
         // Combined exposure limit for this underlying (existing + pending)
         const underlying = stock.symbol;
         const threshold = toDollars(equity * PARAMS.MAX_PERCENTAGE_PER_STOCK);
@@ -825,6 +831,7 @@ async function algo() {
                             // Update budgets and exposure
                             moneySpent += notionalOpt;
                             pendingExposureByUnderlying[underlying] = (pendingExposureByUnderlying[underlying] || 0) + notionalOpt;
+                            tradedSymbolsToday.add(stock.symbol); // Mark symbol as traded today
 
                             // Place mandatory custom bracket exits (includes trailing stop with retries)
                             const exits = await placeCustomBracketOrders({
@@ -880,6 +887,7 @@ async function algo() {
         const notional = toDollars(qty * entryPrice);
         moneySpent += notional;
         pendingExposureByUnderlying[underlying] = (pendingExposureByUnderlying[underlying] || 0) + notional;
+        tradedSymbolsToday.add(stock.symbol); // Mark symbol as traded today
 
         // Place mandatory custom bracket exits (includes trailing stop with retries)
         const exits = await placeCustomBracketOrders({

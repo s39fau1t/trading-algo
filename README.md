@@ -27,6 +27,7 @@ Interactive commands (type in the same terminal and press Enter):
 - "pump": Resume placing trades/orders. Previously closed positions are not reinstated.
 
 Notes:
+- **One trade per ticker per day**: The bot tracks which symbols have been traded each day (ET calendar) and will not place a second trade on the same ticker, even if the position was closed. This prevents overtrading and helps manage risk.
 - Trading window: The bot only begins placing trades from market open + LOOKBACK_MINUTES (default 9:30 AM ET + 10 min = 9:40 AM ET). If you adjust LOOKBACK_MINUTES, the start time shifts accordingly.
 - Off-hours enforcement: From 3:30 PM ET until the next 9:40 AM ET, the bot enforces a flat state:
   - All positions are closed first, then any remaining open orders are canceled.
