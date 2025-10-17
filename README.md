@@ -41,12 +41,13 @@ Notes:
     - Take profit: limit order at TAKE_PROFIT_PERCENT above entry.
   - A background monitor cancels the two sibling exits when one exit fills (OCO-like behavior). Trailing stop placement is retried to improve reliability.
 - Exposure and sizing:
-  - Per-symbol exposure cap (MAX_PERCENTAGE_PER_STOCK of equity) is computed by underlying and includes both equity and options market value.
+  - A single cap controls both per-trade spend and per-symbol exposure: MAX_TRADE_PCT_OF_INITIAL_BP (default 3% of the day’s initial buying power).
+  - Per-symbol exposure cap is computed by underlying and includes both equity and options market value.
   - Per-iteration and per-trade budgets respect:
     - Initial day buying power snapshot (resets on ET date change),
+    - The 3% cap per trade and per underlying,
     - Daily cap MAX_PER_DAY,
-    - Liquidity cap based on minute volume and price (SPEND_MULT),
-    - MAX_BUYING_POWER_AT_ONCE applied to both initial and current buying power.
+    - Liquidity cap based on minute volume and price (SPEND_MULT).
   - Quantities are whole numbers only (whole shares, whole option contracts).
 - Data feed and lookback:
   - Uses IEX feed for snapshots and 1-minute bars to avoid SIP restrictions.

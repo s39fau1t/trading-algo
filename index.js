@@ -25,12 +25,11 @@ const PARAMS = {
     MAX_PER_DAY: 2000,
     //Minimum price of a stock before consider buying it (dollars)
     MIN_PRICE: 5,
-    //Maximum percentage of the portfolio that can be one stock
-    MAX_PERCENTAGE_PER_STOCK: 0.03,
+    // Single cap for both per-stock exposure and per-trade spend,
+    // measured as a fraction of the day's initial buying power (e.g., 0.03 = 3%)
+    MAX_TRADE_PCT_OF_INITIAL_BP: 0.03,
     //Multiplier for the amount to spend on a particular stock
     SPEND_MULT: 0.05,
-    //Maximum percentage of buying power that can be spent on a particular stock at once
-    MAX_BUYING_POWER_AT_ONCE: 0.02,
     //Multiplier to calculate the take profit price for bracket orders (ask price * LIMIT_PRICE_MULT = limit_price)
     LIMIT_PRICE_MULT: 1.1,
     //Multiplier to calculate the stop price (ask price * STOP_PRICE_MULT = stop_price)
@@ -766,15 +765,17 @@ async function algo() {
 
         // Combined exposure limit for this underlying (existing + pending)
         const underlying = stock.symbol;
-        const threshold = toDollars(equity * PARAMS.MAX_PERCENTAGE_PER_STOCK);
+        // Use initialBuyingPower * MAX_TRADE_PCT_OF_INITIAL_BP for per-stock exposure cap
+        const threshold = toDollars(initialBuyingPower * PARAMS.MAX_TRADE_PCT_OF_INITIAL_BP);
         const currentMV = toDollars((exposureByUnderlying[underlying] || 0) + (pendingExposureByUnderlying[underlying] || 0));
         const exposureCapacity = Math.max(0, toDollars(threshold - currentMV));
         if (exposureCapacity <= 0) continue;
 
-        // Per-trade sizing caps
+        // Per-trade sizing cap based on the day's initial buying power
+        const perTradeCap = toDollars(initialBuyingPower * PARAMS.MAX_TRADE_PCT_OF_INITIAL_BP);
+
+        // Liquidity cap
         const volumeCap = toDollars(stock.volume * stock.ask * PARAMS.SPEND_MULT);
-        const perTradeCapInitial = toDollars(initialBuyingPower * PARAMS.MAX_BUYING_POWER_AT_ONCE);
-        const perTradeCapRuntime = toDollars(buyingPower * PARAMS.MAX_BUYING_POWER_AT_ONCE);
 
         // Budget available for this symbol
         let symbolCap = Math.min(
@@ -782,8 +783,7 @@ async function algo() {
             dailyRemainingNow,
             volumeCap,
             exposureCapacity,
-            perTradeCapInitial,
-            perTradeCapRuntime
+            perTradeCap
         );
         symbolCap = toDollars(Math.max(0, symbolCap));
         if (symbolCap < PARAMS.MIN_PRICE) continue;
