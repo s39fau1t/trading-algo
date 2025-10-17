@@ -5,6 +5,7 @@
 //testing commit 3
 
 import Ratelimiter from "./ratelimiter.js";
+import readline from "node:readline";
 
 const API = Object.freeze({
     DOMAIN: "alpaca.markets/v2",
@@ -49,6 +50,9 @@ const PARAMS = {
 
 const ratelimiter = new Ratelimiter(RATELIMIT_MAX_REQ, RATELIMIT_TIMESPAN);
 
+// Add: readline interface handle
+let rl = null;
+
 // --- Logging helpers (ET timestamp) ---
 function etNow() {
     return new Intl.DateTimeFormat("en-US", {
@@ -60,7 +64,16 @@ function etNow() {
     }).format(new Date());
 }
 function log(...args) {
-    console.log(`[${etNow()} ET]`, ...args);
+    const msg = `[${etNow()} ET] ${args.join(" ")}`;
+    if (process.stdout.isTTY && rl) {
+        // Clear the current input line, print log, then restore the prompt + input
+        readline.clearLine(process.stdout, 0);
+        readline.cursorTo(process.stdout, 0);
+        console.log(msg);
+        rl.prompt(true);
+    } else {
+        console.log(msg);
+    }
 }
 
 // Add: runtime trading pause flag
@@ -82,6 +95,9 @@ function formatDuration(ms) {
 }
 
 function drawProgress(remaining, total, label = "Next run in") {
+    // If we have an interactive prompt, avoid drawing an animated bar that overwrites input
+    if (rl && process.stdout.isTTY) return;
+
     if (!process.stdout.isTTY) return;
     const cols = process.stdout.columns || 80;
     const barWidth = Math.max(10, Math.min(40, cols - 40));
@@ -102,19 +118,24 @@ function waitWithProgress(totalMs, label = "Next run in") {
 
             if (stopped) {
                 clearInterval(handle);
-                if (process.stdout.isTTY) process.stdout.write("\n");
+                if (process.stdout.isTTY && !rl) process.stdout.write("\n");
                 return resolve();
             }
 
-            if (process.stdout.isTTY) {
-                drawProgress(remaining, totalMs, label);
+            // With readline active: emit a one-time status at the start; no animated bar
+            if (rl && process.stdout.isTTY) {
+                if (elapsed === 0) {
+                    log(label, formatDuration(totalMs));
+                }
+            } else if (process.stdout.isTTY) {
+                drawProgress(remaining, total, label);
             } else if (elapsed === 0) {
                 log(label, formatDuration(totalMs));
             }
 
             if (remaining <= 0) {
                 clearInterval(handle);
-                if (process.stdout.isTTY) process.stdout.write("\n");
+                if (process.stdout.isTTY && !rl) process.stdout.write("\n");
                 resolve();
             }
         }, 250);
@@ -845,28 +866,41 @@ async function algo() {
 await ensureDayState();
 log("Initialized. Tradable NYSE symbols:", symbols.length);
 
-// Add: stdin command handler ("dump it" / "pump it")
-process.stdin.setEncoding("utf8");
-process.stdin.resume();
-process.stdin.on("data", async (chunk) => {
-    for (const raw of chunk.split(/\r?\n/)) {
-        const line = raw.trim();
-        if (!line) continue;
-        const cmd = line.toLowerCase();
-
-        if (cmd === "dump it") {
-            tradingPaused = true; // immediately prevent new orders
-            log('Command: "dump it" received -> flattening and pausing trading.');
-            await flattenAndCancel();
-            log('Dump complete. Trading remains paused until "pump it".');
-        } else if (cmd === "pump it") {
-            tradingPaused = false;
-            log('Command: "pump it" received -> trading resumed (no positions reinstated).');
-        } else {
-            log("Unknown command:", line);
-        }
-    }
+// Replace raw stdin handler with readline prompt
+rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    prompt: "cmd> "
 });
+rl.on("line", async (raw) => {
+    const line = String(raw || "").trim();
+    if (!line) {
+        rl.prompt();
+        return;
+    }
+    const cmd = line.toLowerCase();
+
+    if (cmd === "dump it") {
+        tradingPaused = true; // immediately prevent new orders
+        log('Command: "dump it" received -> flattening and pausing trading.');
+        await flattenAndCancel();
+        log('Dump complete. Trading remains paused until "pump it".');
+    } else if (cmd === "pump it") {
+        tradingPaused = false;
+        log('Command: "pump it" received -> trading resumed (no positions reinstated).');
+    } else {
+        log("Unknown command:", line);
+    }
+    rl.prompt();
+});
+rl.on("SIGINT", () => {
+    // Handle Ctrl+C gracefully
+    log("SIGINT received. Exiting...");
+    stopped = true;
+    rl.close();
+    process.exit(0);
+});
+rl.prompt();
 
 // --- Scheduler: run loop + countdown progress bar ---
 async function runLoop() {
