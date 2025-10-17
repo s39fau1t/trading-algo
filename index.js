@@ -80,6 +80,8 @@ function log(...args) {
 let tradingPaused = false;
 // Add: automatic off-hours guard (3:30 PM -> 9:40 AM ET)
 let offHoursActive = false;
+// Add: track if pause was caused by off-hours so we can auto-resume at open
+let pausedByOffHours = false;
 
 // --- Terminal countdown progress bar ---
 let handle; // reuses the existing handle variable for the progress timer
@@ -621,6 +623,46 @@ async function placeCustomBracketOrders({ symbol, qty, assetClass, entryPrice })
         trailingStopOrderId: trailingStopOrder.id,
         takeProfitOrderId: takeProfitOrder.id
     };
+}
+
+// Add: enforce off-hours state (flat positions, no open orders, pause trading)
+async function enforceOffHours() {
+    const offNow = isOffHoursET();
+
+    if (offNow) {
+        if (!offHoursActive) {
+            offHoursActive = true;
+            tradingPaused = true;
+            pausedByOffHours = true;
+            const startMins = getTradingStartMinutesET();
+            log(`Off-hours detected. Trading paused until ${formatMinutesAsHHMM(startMins)} ET. Ensuring flat state...`);
+        }
+
+        try {
+            const [positions, openOrders] = await Promise.all([
+                request("positions", API.TRADE).catch(() => []),
+                request("orders", API.TRADE, { params: { status: "open" } }).catch(() => [])
+            ]);
+            if ((Array.isArray(positions) && positions.length > 0) || (Array.isArray(openOrders) && openOrders.length > 0)) {
+                await flattenAndCancel();
+            }
+        } catch (e) {
+            log("Off-hours flatten error:", e?.message || e);
+        }
+        return true; // skip trading work in algo()
+    } else {
+        if (offHoursActive) {
+            offHoursActive = false;
+            if (pausedByOffHours) {
+                tradingPaused = false;
+                pausedByOffHours = false;
+                log("Market window open: off-hours ended. Trading resumed.");
+            } else {
+                log("Market window open.");
+            }
+        }
+        return false;
+    }
 }
 
 async function algo() {
