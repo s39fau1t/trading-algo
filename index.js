@@ -488,6 +488,44 @@ async function flattenAndCancel() {
     log("Flatten-and-cancel complete.");
 }
 
+// Add: non-blocking OCO monitor helper (detached)
+async function monitorOCO(stopLossOrderId, trailingStopOrderId, takeProfitOrderId) {
+    const cancelIfOpen = async (id) => {
+        try { await request(`orders/${id}`, API.TRADE, { method: "DELETE" }); } catch {}
+    };
+    try {
+        let resolved = false;
+        while (!resolved) {
+            const [slStatus, tsStatus, tpStatus] = await Promise.all([
+                request(`orders/${stopLossOrderId}`, API.TRADE),
+                request(`orders/${trailingStopOrderId}`, API.TRADE),
+                request(`orders/${takeProfitOrderId}`, API.TRADE)
+            ]);
+
+            if (slStatus.status === "filled") {
+                await Promise.all([cancelIfOpen(trailingStopOrderId), cancelIfOpen(takeProfitOrderId)]);
+                resolved = true;
+            } else if (tsStatus.status === "filled") {
+                await Promise.all([cancelIfOpen(stopLossOrderId), cancelIfOpen(takeProfitOrderId)]);
+                resolved = true;
+            } else if (tpStatus.status === "filled") {
+                await Promise.all([cancelIfOpen(stopLossOrderId), cancelIfOpen(trailingStopOrderId)]);
+                resolved = true;
+            } else if (
+                ["canceled", "expired"].includes(slStatus.status) &&
+                ["canceled", "expired"].includes(tsStatus.status) &&
+                ["canceled", "expired"].includes(tpStatus.status)
+            ) {
+                resolved = true;
+            } else {
+                await new Promise(res => setTimeout(res, 5000));
+            }
+        }
+    } catch {
+        // swallow background errors
+    }
+}
+
 async function algo() {
     log("Iteration start");
 
@@ -564,49 +602,60 @@ async function algo() {
         exposureByUnderlying[underlying] = (exposureByUnderlying[underlying] || 0) + parseFloat(p.market_value);
     }
 
+    // New: per-iteration allocation based on initial day BP
+    let remainingAlloc = toDollars(Math.max(0, initialBuyingPower - moneySpent - 5));
+    let dailyRemainingNow = toDollars(Math.max(0, PARAMS.MAX_PER_DAY - moneySpent));
+    if (remainingAlloc < PARAMS.MIN_PRICE || dailyRemainingNow < PARAMS.MIN_PRICE) {
+        log("Insufficient remaining budget for new trades this iteration.");
+        return;
+    }
+
+    // Track pending exposure additions within this iteration
+    const pendingExposureByUnderlying = {};
+
     for (const stock of stocks) {
-        // Enforce combined exposure limit
-        const combinedMV = exposureByUnderlying[stock.symbol] || 0;
-        if (combinedMV / equity >= PARAMS.MAX_PERCENTAGE_PER_STOCK) {
-            continue;
-        }
+        // Stop if we ran out of allocation or daily cap room
+        remainingAlloc = toDollars(Math.max(0, initialBuyingPower - moneySpent - 5));
+        dailyRemainingNow = toDollars(Math.max(0, PARAMS.MAX_PER_DAY - moneySpent));
+        if (remainingAlloc < PARAMS.MIN_PRICE || dailyRemainingNow < PARAMS.MIN_PRICE) break;
+
+        // Combined exposure limit for this underlying (existing + pending)
+        const underlying = stock.symbol;
+        const threshold = toDollars(equity * PARAMS.MAX_PERCENTAGE_PER_STOCK);
+        const currentMV = toDollars((exposureByUnderlying[underlying] || 0) + (pendingExposureByUnderlying[underlying] || 0));
+        const exposureCapacity = Math.max(0, toDollars(threshold - currentMV));
+        if (exposureCapacity <= 0) continue;
 
         // Per-trade sizing caps
-        const perTradeCap = toDollars(initialBuyingPower * 0.02); // 2% of initial day BP
-        const volumeCap = toDollars(stock.volume * stock.ask * PARAMS.SPEND_MULT); // 5% of current minute volume $
-        let targetNotional = Math.min(perTradeCap, volumeCap);
+        const volumeCap = toDollars(stock.volume * stock.ask * PARAMS.SPEND_MULT);
+        const perTradeCapInitial = toDollars(initialBuyingPower * PARAMS.MAX_BUYING_POWER_AT_ONCE);
+        const perTradeCapRuntime = toDollars(buyingPower * PARAMS.MAX_BUYING_POWER_AT_ONCE);
 
-        // Skip if target notional would exceed remaining daily budget
-        if (moneySpent + targetNotional > PARAMS.MAX_PER_DAY) {
-            continue;
-        }
+        // Budget available for this symbol
+        let symbolCap = Math.min(
+            remainingAlloc,
+            dailyRemainingNow,
+            volumeCap,
+            exposureCapacity,
+            perTradeCapInitial,
+            perTradeCapRuntime
+        );
+        symbolCap = toDollars(Math.max(0, symbolCap));
+        if (symbolCap < PARAMS.MIN_PRICE) continue;
 
-        // Try to buy ITM call options first using the same target notional
-        let didOptionTrade = false;
+        // Try to buy ITM call options first using symbolCap
+        let traded = false;
         try {
             const targetStrike = stock.ask * 0.95;
             const contract = await getNearestITMCallContract(stock.symbol, targetStrike);
             if (contract && contract.symbol) {
-                const quotes = await request("options/quotes/latest", API.DATA, {
-                    params: { symbols: contract.symbol }
-                });
+                const quotes = await request("options/quotes/latest", API.DATA, { params: { symbols: contract.symbol } });
                 const optQuote = quotes[contract.symbol] || quotes.latestQuote || quotes.latestQuotes?.[contract.symbol];
                 const optAsk = optQuote?.ap || optQuote?.ask_price || 0;
 
                 if (optAsk > 0) {
-                    // Calculate whole contracts from target notional (100x multiplier)
-                    const contractsQty = toWholeQty(targetNotional / (optAsk * 100));
+                    const contractsQty = toWholeQty(symbolCap / (optAsk * 100));
                     if (contractsQty > 0) {
-                        const notionalOpt = toDollars(contractsQty * optAsk * 100);
-
-                        // Skip if insufficient cash
-                        if (notionalOpt > buyingPower) {
-                            log("Skip option (insufficient cash):", contract.symbol, "need", notionalOpt);
-                            continue;
-                        }
-
-                        log("Option BUY", contract.symbol, "qty", contractsQty, "ask", toDollars(optAsk));
-
                         // Place buy order (option)
                         const buyOrder = await request("orders", API.TRADE, {
                             method: "POST",
@@ -625,151 +674,79 @@ async function algo() {
                         let buyOrderStatus;
                         for (let i = 0; i < 10; i++) {
                             buyOrderStatus = await request(`orders/${buyOrder.id}`, API.TRADE);
-                            if (buyOrderStatus.status === "filled") {
-                                filled = true;
-                                break;
-                            }
+                            if (buyOrderStatus.status === "filled") { filled = true; break; }
                             await new Promise(res => setTimeout(res, 2000));
                         }
                         if (!filled) {
                             log(`Option buy not filled in time: ${contract.symbol}`);
-                            continue;
-                        }
+                        } else {
+                            // Actual spend and risk tracking
+                            const entryPriceOpt = parseFloat(buyOrderStatus.filled_avg_price || optAsk);
+                            const notionalOpt = toDollars(contractsQty * entryPriceOpt * 100);
 
-                        // Record spend using actual notional
-                        moneySpent += notionalOpt;
+                            // Update budgets and exposure
+                            moneySpent += notionalOpt;
+                            pendingExposureByUnderlying[underlying] = (pendingExposureByUnderlying[underlying] || 0) + notionalOpt;
 
-                        // Compute entry price and take profit for option (per-contract premium)
-                        const entryPriceOpt = parseFloat(buyOrderStatus.filled_avg_price || optAsk);
-                        log("Option FILLED", contract.symbol, "avg", toDollars(entryPriceOpt));
-                        const takeProfitPriceOpt = toDollars(entryPriceOpt * (1 + PARAMS.TAKE_PROFIT_PERCENT / 100));
+                            // Place exits
+                            const takeProfitPriceOpt = toDollars(entryPriceOpt * (1 + PARAMS.TAKE_PROFIT_PERCENT / 100));
+                            const stopLossPrice = Math.min(toDollars(entryPriceOpt * PARAMS.STOP_PRICE_MULT), entryPriceOpt - 0.01);
 
-                        // Place stop-loss sell (option)
-                        const stopLossPrice = Math.min(toDollars(entryPriceOpt * PARAMS.STOP_PRICE_MULT), entryPriceOpt - 0.01);
-                        const stopLossOrder = await request("orders", API.TRADE, {
-                            method: "POST",
-                            body: JSON.stringify({
-                                symbol: contract.symbol,
-                                asset_class: "option",
-                                qty: contractsQty,
-                                side: "sell",
-                                type: "stop",
-                                time_in_force: "gtc",
-                                stop_price: stopLossPrice
-                            })
-                        });
+                            const stopLossOrder = await request("orders", API.TRADE, {
+                                method: "POST",
+                                body: JSON.stringify({
+                                    symbol: contract.symbol,
+                                    asset_class: "option",
+                                    qty: contractsQty,
+                                    side: "sell",
+                                    type: "stop",
+                                    time_in_force: "gtc",
+                                    stop_price: stopLossPrice
+                                })
+                            });
+                            const trailingStopOrder = await request("orders", API.TRADE, {
+                                method: "POST",
+                                body: JSON.stringify({
+                                    symbol: contract.symbol,
+                                    asset_class: "option",
+                                    qty: contractsQty,
+                                    side: "sell",
+                                    type: "trailing_stop",
+                                    time_in_force: "gtc",
+                                    trail_percent: PARAMS.TRAILING_STOP_PERCENT
+                                })
+                            });
+                            const takeProfitOrder = await request("orders", API.TRADE, {
+                                method: "POST",
+                                body: JSON.stringify({
+                                    symbol: contract.symbol,
+                                    asset_class: "option",
+                                    qty: contractsQty,
+                                    side: "sell",
+                                    type: "limit",
+                                    time_in_force: "gtc",
+                                    limit_price: takeProfitPriceOpt
+                                })
+                            });
 
-                        // Place trailing stop sell (option)
-                        const trailingStopOrder = await request("orders", API.TRADE, {
-                            method: "POST",
-                            body: JSON.stringify({
-                                symbol: contract.symbol,
-                                asset_class: "option",
-                                qty: contractsQty,
-                                side: "sell",
-                                type: "trailing_stop",
-                                time_in_force: "gtc",
-                                trail_percent: PARAMS.TRAILING_STOP_PERCENT
-                            })
-                        });
-
-                        // Place take-profit limit sell (option)
-                        const takeProfitOrder = await request("orders", API.TRADE, {
-                            method: "POST",
-                            body: JSON.stringify({
-                                symbol: contract.symbol,
-                                asset_class: "option",
-                                qty: contractsQty,
-                                side: "sell",
-                                type: "limit",
-                                time_in_force: "gtc",
-                                limit_price: takeProfitPriceOpt
-                            })
-                        });
-
-                        log("Option OCO placed", contract.symbol, "TP", takeProfitPriceOpt, "SL", Math.min(toDollars(entryPriceOpt * PARAMS.STOP_PRICE_MULT), entryPriceOpt - 0.01), "TR", `${PARAMS.TRAILING_STOP_PERCENT}%`);
-
-                        // OCO monitor (three orders): cancel the other two when one fills
-                        let ocoResolved = false;
-                        while (!ocoResolved) {
-                            const [slStatus, tsStatus, tpStatus] = await Promise.all([
-                                request(`orders/${stopLossOrder.id}`, API.TRADE),
-                                request(`orders/${trailingStopOrder.id}`, API.TRADE),
-                                request(`orders/${takeProfitOrder.id}`, API.TRADE)
-                            ]);
-
-                            const cancelIfOpen = async (id) => {
-                                try { await request(`orders/${id}`, API.TRADE, { method: "DELETE" }); } catch {}
-                            };
-
-                            if (slStatus.status === "filled") {
-                                await Promise.all([
-                                    cancelIfOpen(trailingStopOrder.id),
-                                    cancelIfOpen(takeProfitOrder.id)
-                                ]);
-                                ocoResolved = true;
-                            } else if (tsStatus.status === "filled") {
-                                await Promise.all([
-                                    cancelIfOpen(stopLossOrder.id),
-                                    cancelIfOpen(takeProfitOrder.id)
-                                ]);
-                                ocoResolved = true;
-                            } else if (tpStatus.status === "filled") {
-                                await Promise.all([
-                                    cancelIfOpen(stopLossOrder.id),
-                                    cancelIfOpen(trailingStopOrder.id)
-                                ]);
-                                ocoResolved = true;
-                            } else if (
-                                ["canceled", "expired"].includes(slStatus.status) &&
-                                ["canceled", "expired"].includes(tsStatus.status) &&
-                                ["canceled", "expired"].includes(tpStatus.status)
-                            ) {
-                                ocoResolved = true;
-                            } else {
-                                await new Promise(res => setTimeout(res, 5000));
-                            }
-                        }
-
-                        // If we reached here, option trade completed; skip stock trade
-                        didOptionTrade = true;
-
-                        if (moneySpent + PARAMS.MIN_PRICE > PARAMS.MAX_PER_DAY) {
-                            break;
+                            // Fire-and-forget OCO monitoring
+                            monitorOCO(stopLossOrder.id, trailingStopOrder.id, takeProfitOrder.id).catch(() => {});
+                            log("Option BUY", contract.symbol, "qty", contractsQty, "avg", toDollars(entryPriceOpt));
+                            traded = true;
                         }
                     }
                 }
             }
-        } catch (_) {
-            // Swallow option errors and fall back to stock path
+        } catch {
+            // ignore option path errors; try equity
         }
-        if (didOptionTrade) continue;
+        if (traded) continue;
 
-        // Fallback: original stock trade path
-        //$ amount to buy (probably fractional)
-        let notional = toDollars(Math.min(buyingPower * PARAMS.MAX_BUYING_POWER_AT_ONCE, stock.volume * stock.ask * PARAMS.SPEND_MULT));
+        // Fallback: equity trade using symbolCap
+        const qty = toWholeQty(symbolCap / stock.ask);
+        if (qty === 0) continue;
 
-        //try to spend the last of our money if we were going to go over
-        if(moneySpent + notional > PARAMS.MAX_PER_DAY) {
-            notional = PARAMS.MAX_PER_DAY - moneySpent;
-        }
-
-        //convert to shares — enforce whole shares
-        const qty = toWholeQty(notional / stock.ask);
-
-        //don't bother buying 0 shares :)
-        //this, along with the if statement above, also implicitly ensures that we don't go over our spending limit
-        if(qty === 0) {
-            continue;
-        }
-
-        log("Equity BUY", stock.symbol, "qty", qty, "ask", toDollars(stock.ask));
-
-        //actual dollar amount we're buying now
-        moneySpent += qty * stock.ask;
-
-        // --- Custom Bracket Order with Stop Loss and Trailing Stop (OCO) ---
-        // Place market buy order
+        // Place market buy (equity)
         const buyOrder = await request("orders", API.TRADE, {
             method: "POST",
             body: JSON.stringify({
@@ -786,10 +763,7 @@ async function algo() {
         let buyOrderStatus;
         for (let i = 0; i < 10; i++) {
             buyOrderStatus = await request(`orders/${buyOrder.id}`, API.TRADE);
-            if (buyOrderStatus.status === "filled") {
-                filled = true;
-                break;
-            }
+            if (buyOrderStatus.status === "filled") { filled = true; break; }
             await new Promise(res => setTimeout(res, 2000));
         }
         if (!filled) {
@@ -797,13 +771,16 @@ async function algo() {
             continue;
         }
 
-        // Compute entry price and take profit for stock
+        // Compute entry price and update budgets/exposure
         const entryPrice = parseFloat(buyOrderStatus.filled_avg_price || stock.ask);
-        log("Equity FILLED", stock.symbol, "avg", toDollars(entryPrice));
-        const takeProfitPrice = toDollars(entryPrice * (1 + PARAMS.TAKE_PROFIT_PERCENT / 100));
+        const notional = toDollars(qty * entryPrice);
+        moneySpent += notional;
+        pendingExposureByUnderlying[underlying] = (pendingExposureByUnderlying[underlying] || 0) + notional;
 
-        // Place stop-loss sell order
+        // Place exits
+        const takeProfitPrice = toDollars(entryPrice * (1 + PARAMS.TAKE_PROFIT_PERCENT / 100));
         const stopLossPrice = Math.min(toDollars(entryPrice * PARAMS.STOP_PRICE_MULT), entryPrice - 0.01);
+
         const stopLossOrder = await request("orders", API.TRADE, {
             method: "POST",
             body: JSON.stringify({
@@ -815,8 +792,6 @@ async function algo() {
                 stop_price: stopLossPrice
             })
         });
-
-        // Place trailing stop sell order
         const trailingStopOrder = await request("orders", API.TRADE, {
             method: "POST",
             body: JSON.stringify({
@@ -828,8 +803,6 @@ async function algo() {
                 trail_percent: PARAMS.TRAILING_STOP_PERCENT
             })
         });
-
-        // Place take-profit limit sell order
         const takeProfitOrder = await request("orders", API.TRADE, {
             method: "POST",
             body: JSON.stringify({
@@ -842,62 +815,17 @@ async function algo() {
             })
         });
 
-        log("Equity OCO placed", stock.symbol, "TP", takeProfitPrice, "SL", Math.min(toDollars(entryPrice * PARAMS.STOP_PRICE_MULT), entryPrice - 0.01), "TR", `${PARAMS.TRAILING_STOP_PERCENT}%`);
+        // Fire-and-forget OCO monitoring
+        monitorOCO(stopLossOrder.id, trailingStopOrder.id, takeProfitOrder.id).catch(() => {});
+        log("Equity BUY", stock.symbol, "qty", qty, "avg", toDollars(entryPrice));
 
-        // OCO logic: monitor three sell orders, cancel the other two when one fills
-        let ocoResolved = false;
-        while (!ocoResolved) {
-            const [slStatus, tsStatus, tpStatus] = await Promise.all([
-                request(`orders/${stopLossOrder.id}`, API.TRADE),
-                request(`orders/${trailingStopOrder.id}`, API.TRADE),
-                request(`orders/${takeProfitOrder.id}`, API.TRADE)
-            ]);
-
-            const cancelIfOpen = async (id) => {
-                try { await request(`orders/${id}`, API.TRADE, { method: "DELETE" }); } catch {}
-            };
-
-            if (slStatus.status === "filled") {
-                await Promise.all([
-                    cancelIfOpen(trailingStopOrder.id),
-                    cancelIfOpen(takeProfitOrder.id)
-                ]);
-                ocoResolved = true;
-                console.log(`Stop-loss filled for ${stock.symbol}, trailing stop and take-profit canceled.`);
-            } else if (tsStatus.status === "filled") {
-                await Promise.all([
-                    cancelIfOpen(stopLossOrder.id),
-                    cancelIfOpen(takeProfitOrder.id)
-                ]);
-                ocoResolved = true;
-                console.log(`Trailing stop filled for ${stock.symbol}, stop-loss and take-profit canceled.`);
-            } else if (tpStatus.status === "filled") {
-                await Promise.all([
-                    cancelIfOpen(stopLossOrder.id),
-                    cancelIfOpen(trailingStopOrder.id)
-                ]);
-                ocoResolved = true;
-                console.log(`Take-profit filled for ${stock.symbol}, stop-loss and trailing stop canceled.`);
-            } else if (
-                ["canceled", "expired"].includes(slStatus.status) &&
-                ["canceled", "expired"].includes(tsStatus.status) &&
-                ["canceled", "expired"].includes(tpStatus.status)
-            ) {
-                ocoResolved = true;
-            } else {
-                await new Promise(res => setTimeout(res, 5000));
-            }
-        }
-
-        //since we're only buying whole shares, this ensures the algo won't run infinetly doing nothing
-        //we know we won't be able to buy any more shares anyway in this case, so just exit
-        if(moneySpent + PARAMS.MIN_PRICE > PARAMS.MAX_PER_DAY) {
-            log("Daily budget reached. Initiating cleanup...");
-            break;
-        }
+        // Guard: stop if we have no budget left for at least one more min trade
+        remainingAlloc = toDollars(Math.max(0, initialBuyingPower - moneySpent - 5));
+        dailyRemainingNow = toDollars(Math.max(0, PARAMS.MAX_PER_DAY - moneySpent));
+        if (remainingAlloc < PARAMS.MIN_PRICE || dailyRemainingNow < PARAMS.MIN_PRICE) break;
     }
 
-    if(moneySpent + PARAMS.MIN_PRICE > PARAMS.MAX_PER_DAY) {
+    if (moneySpent + PARAMS.MIN_PRICE > PARAMS.MAX_PER_DAY) {
         await cleanup();
     }
 }
