@@ -857,11 +857,7 @@ async function algo() {
 
     log("Candidates:", stocks.length);
 
-    const account = await request("account", API.TRADE);
-    const equity = parseFloat(account.equity);
-    const buyingPower = parseFloat(account.cash);
-
-    // Build combined exposure (equity + options) by underlying symbol
+    // Snapshot combined exposure (equity + options) by underlying symbol
     const positions = await request("positions", API.TRADE);
     const exposureByUnderlying = {};
     for (const p of positions) {
@@ -869,53 +865,14 @@ async function algo() {
         exposureByUnderlying[underlying] = (exposureByUnderlying[underlying] || 0) + parseFloat(p.market_value);
     }
 
-    // New: per-iteration allocation based on initial day BP
-    let remainingAlloc = toDollars(Math.max(0, initialBuyingPower - moneySpent - 5));
-    let dailyRemainingNow = toDollars(Math.max(0, PARAMS.MAX_PER_DAY - moneySpent));
-    if (remainingAlloc < PARAMS.MIN_PRICE || dailyRemainingNow < PARAMS.MIN_PRICE) {
-        log("Insufficient remaining budget for new trades this iteration.");
-        return;
-    }
-
-    // Track pending exposure additions within this iteration
+    // New: per-iteration remaining allocation based on initial day BP (not current cash)
+    const perTradeCap = toDollars(initialBuyingPower * PARAMS.MAX_TRADE_PCT_OF_INITIAL_BP);
     const pendingExposureByUnderlying = {};
+    const usedUnderlyings = new Set(); // avoid allocating same underlying twice in the same iteration
 
-    for (const stock of stocks) {
-        // Stop if we ran out of allocation or daily cap room
-        remainingAlloc = toDollars(Math.max(0, initialBuyingPower - moneySpent - 5));
-        dailyRemainingNow = toDollars(Math.max(0, PARAMS.MAX_PER_DAY - moneySpent));
-        if (remainingAlloc < PARAMS.MIN_PRICE || dailyRemainingNow < PARAMS.MIN_PRICE) break;
-
-        // Skip if we already traded this symbol today
-        if (tradedSymbolsToday.has(stock.symbol)) continue;
-
-        // Combined exposure limit for this underlying (existing + pending)
-        const underlying = stock.symbol;
-        // Use initialBuyingPower * MAX_TRADE_PCT_OF_INITIAL_BP for per-stock exposure cap
-        const threshold = toDollars(initialBuyingPower * PARAMS.MAX_TRADE_PCT_OF_INITIAL_BP);
-        const currentMV = toDollars((exposureByUnderlying[underlying] || 0) + (pendingExposureByUnderlying[underlying] || 0));
-        const exposureCapacity = Math.max(0, toDollars(threshold - currentMV));
-        if (exposureCapacity <= 0) continue;
-
-        // Per-trade sizing cap based on the day's initial buying power
-        const perTradeCap = toDollars(initialBuyingPower * PARAMS.MAX_TRADE_PCT_OF_INITIAL_BP);
-
-        // Liquidity cap
-        const volumeCap = toDollars(stock.volume * stock.ask * PARAMS.SPEND_MULT);
-
-        // Budget available for this symbol
-        let symbolCap = Math.min(
-            remainingAlloc,
-            dailyRemainingNow,
-            volumeCap,
-            exposureCapacity,
-            perTradeCap
-        );
-        symbolCap = toDollars(Math.max(0, symbolCap));
-        if (symbolCap < PARAMS.MIN_PRICE) continue;
-
-        // Try to buy ITM call options first using symbolCap
-        let traded = false;
+    // Helper to plan one symbol (options-first, fallback equity)
+    const planOne = async (stock, symbolCap) => {
+        // Try options first
         try {
             const targetStrike = stock.ask * 0.95;
             const contract = await getNearestITMCallContract(stock.symbol, targetStrike);
@@ -923,123 +880,147 @@ async function algo() {
                 const quotes = await request("options/quotes/latest", API.DATA, { params: { symbols: contract.symbol } });
                 const optQuote = quotes[contract.symbol] || quotes.latestQuote || quotes.latestQuotes?.[contract.symbol];
                 const optAsk = optQuote?.ap || optQuote?.ask_price || 0;
-
                 if (optAsk > 0) {
                     const contractsQty = toWholeQty(symbolCap / (optAsk * 100));
                     if (contractsQty > 0) {
-                        // Place buy order (option)
-                        const buyOrder = await request("orders", API.TRADE, {
-                            method: "POST",
-                            body: JSON.stringify({
-                                symbol: contract.symbol,
-                                asset_class: "option",
-                                qty: contractsQty,
-                                side: "buy",
-                                type: "market",
-                                time_in_force: "day"
-                            })
-                        });
-
-                        // Wait for fill
-                        let filled = false;
-                        let buyOrderStatus;
-                        for (let i = 0; i < 10; i++) {
-                            buyOrderStatus = await request(`orders/${buyOrder.id}`, API.TRADE);
-                            if (buyOrderStatus.status === "filled") { filled = true; break; }
-                            await new Promise(res => setTimeout(res, 2000));
-                        }
-                        if (!filled) {
-                            log(`Option buy not filled in time: ${contract.symbol}`);
-                        } else {
-                            const entryPriceOpt = parseFloat(buyOrderStatus.filled_avg_price || optAsk);
-                            const notionalOpt = toDollars(contractsQty * entryPriceOpt * 100);
-
-                            // Update budgets and exposure
-                            moneySpent += notionalOpt;
-                            pendingExposureByUnderlying[underlying] = (pendingExposureByUnderlying[underlying] || 0) + notionalOpt;
-                            tradedSymbolsToday.add(stock.symbol); // Mark symbol as traded today
-
-                            // Place mandatory custom bracket exits (includes trailing stop with retries)
-                            const exits = await placeCustomBracketOrders({
-                                symbol: contract.symbol,
-                                qty: contractsQty,
-                                assetClass: "option",
-                                entryPrice: entryPriceOpt
-                            });
-
-                            // Fire-and-forget OCO monitoring
-                            monitorOCO(exits.stopLossOrderId, exits.trailingStopOrderId, exits.takeProfitOrderId).catch(() => {});
-                            log("Option BUY", contract.symbol, "qty", contractsQty, "avg", toDollars(entryPriceOpt));
-
-                            // Schedule non-profit exit in 10 minutes if not profitable
-                            scheduleNonProfitExit({ symbol: contract.symbol, assetClass: "option" });
-
-                            traded = true;
-                        }
+                        const estSpend = toDollars(contractsQty * optAsk * 100);
+                        return {
+                            symbol: contract.symbol,
+                            underlying: stock.symbol,
+                            assetClass: "option",
+                            qty: contractsQty,
+                            estSpend,
+                            entryAsk: optAsk
+                        };
                     }
                 }
             }
         } catch {
-            // ignore option path errors; try equity
+            // ignore option plan errors
         }
-        if (traded) continue;
 
-        // Fallback: equity trade using symbolCap
+        // Fallback: equity sizing
         const qty = toWholeQty(symbolCap / stock.ask);
-        if (qty === 0) continue;
-
-        // Place market buy (equity)
-        const buyOrder = await request("orders", API.TRADE, {
-            method: "POST",
-            body: JSON.stringify({
+        if (qty > 0) {
+            const estSpend = toDollars(qty * stock.ask);
+            return {
                 symbol: stock.symbol,
+                underlying: stock.symbol,
+                assetClass: undefined,
                 qty,
-                side: "buy",
-                type: "market",
-                time_in_force: "day"
-            })
-        });
-
-        // Wait for the buy order to fill
-        let filled = false;
-        let buyOrderStatus;
-        for (let i = 0; i < 10; i++) {
-            buyOrderStatus = await request(`orders/${buyOrder.id}`, API.TRADE);
-            if (buyOrderStatus.status === "filled") { filled = true; break; }
-            await new Promise(res => setTimeout(res, 2000));
+                estSpend,
+                entryAsk: stock.ask
+            };
         }
-        if (!filled) {
-            log(`Equity buy not filled in time: ${stock.symbol}`);
-            continue;
-        }
+        return null;
+    };
 
-        const entryPrice = parseFloat(buyOrderStatus.filled_avg_price || stock.ask);
-        const notional = toDollars(qty * entryPrice);
-        moneySpent += notional;
-        pendingExposureByUnderlying[underlying] = (pendingExposureByUnderlying[underlying] || 0) + notional;
-        tradedSymbolsToday.add(stock.symbol); // Mark symbol as traded today
-
-        // Place mandatory custom bracket exits (includes trailing stop with retries)
-        const exits = await placeCustomBracketOrders({
-            symbol: stock.symbol,
-            qty,
-            assetClass: undefined,
-            entryPrice
-        });
-
-        // Fire-and-forget OCO monitoring
-        monitorOCO(exits.stopLossOrderId, exits.trailingStopOrderId, exits.takeProfitOrderId).catch(() => {});
-        // Fire-and-forget breakeven stop monitor (equity only)
-        monitorBreakevenStop(stock.symbol, entryPrice, exits.stopLossOrderId).catch(() => {});
-        log("Equity BUY", stock.symbol, "qty", qty, "avg", toDollars(entryPrice));
-
-        // Schedule non-profit exit in 10 minutes if not profitable
-        scheduleNonProfitExit({ symbol: stock.symbol });
-
-        // Guard: stop if we have no budget left for at least one more min trade
-        remainingAlloc = toDollars(Math.max(0, initialBuyingPower - moneySpent - 5));
-        dailyRemainingNow = toDollars(Math.max(0, PARAMS.MAX_PER_DAY - moneySpent));
+    // Wave-based batch buying to consume remaining allocation in one iteration
+    let waves = 0;
+    while (waves < 3) { // up to 3 waves to consume residuals
+        let remainingAlloc = toDollars(Math.max(0, initialBuyingPower - moneySpent - 5));
+        let dailyRemainingNow = toDollars(Math.max(0, PARAMS.MAX_PER_DAY - moneySpent));
         if (remainingAlloc < PARAMS.MIN_PRICE || dailyRemainingNow < PARAMS.MIN_PRICE) break;
+
+        const batchPlans = [];
+
+        for (const stock of stocks) {
+            // Skip if underlying already traded today or already allocated this iteration
+            if (tradedSymbolsToday.has(stock.symbol) || usedUnderlyings.has(stock.symbol)) continue;
+
+            // Combined exposure capacity for this underlying (existing + pending)
+            const currentMV = toDollars((exposureByUnderlying[stock.symbol] || 0) + (pendingExposureByUnderlying[stock.symbol] || 0));
+            const exposureCapacity = Math.max(0, toDollars(perTradeCap - currentMV));
+            if (exposureCapacity < PARAMS.MIN_PRICE) continue;
+
+            // Liquidity cap (minute volume * price * SPEND_MULT)
+            const volumeCap = toDollars(stock.volume * stock.ask * PARAMS.SPEND_MULT);
+
+            // Budget available for this symbol within this wave
+            let symbolCap = Math.min(
+                remainingAlloc,
+                dailyRemainingNow,
+                exposureCapacity,
+                volumeCap,
+                perTradeCap
+            );
+            symbolCap = toDollars(Math.max(0, symbolCap));
+            if (symbolCap < PARAMS.MIN_PRICE) continue;
+
+            // Build plan (try options first)
+            const plan = await planOne(stock, symbolCap);
+            if (!plan) continue;
+
+            // Reserve capacity and budget for this plan
+            batchPlans.push(plan);
+            usedUnderlyings.add(stock.symbol);
+            pendingExposureByUnderlying[stock.symbol] = (pendingExposureByUnderlying[stock.symbol] || 0) + plan.estSpend;
+            remainingAlloc = toDollars(Math.max(0, remainingAlloc - plan.estSpend));
+            dailyRemainingNow = toDollars(Math.max(0, dailyRemainingNow - plan.estSpend));
+
+            if (remainingAlloc < PARAMS.MIN_PRICE || dailyRemainingNow < PARAMS.MIN_PRICE) break;
+        }
+
+        if (batchPlans.length === 0) break;
+
+        // Execute all planned buys concurrently
+        await Promise.all(batchPlans.map(async (p) => {
+            try {
+                const body = {
+                    symbol: p.symbol,
+                    qty: p.qty,
+                    side: "buy",
+                    type: "market",
+                    time_in_force: "day",
+                    ...(p.assetClass === "option" ? { asset_class: "option" } : {})
+                };
+                const buyOrder = await request("orders", API.TRADE, { method: "POST", body: JSON.stringify(body) });
+
+                // Wait for fill
+                let filled = null;
+                for (let i = 0; i < 10; i++) {
+                    const st = await request(`orders/${buyOrder.id}`, API.TRADE);
+                    if (st.status === "filled") { filled = st; break; }
+                    await new Promise(res => setTimeout(res, 2000));
+                }
+                if (!filled) {
+                    log(`Buy not filled in time: ${p.symbol}`);
+                    return;
+                }
+
+                // Compute actual spend
+                const entryPrice = parseFloat(filled.filled_avg_price || p.entryAsk);
+                const notional = p.assetClass === "option"
+                    ? toDollars(p.qty * entryPrice * 100)
+                    : toDollars(p.qty * entryPrice);
+
+                // Update budgets and bookkeeping
+                moneySpent += notional;
+                tradedSymbolsToday.add(p.underlying);
+                pendingExposureByUnderlying[p.underlying] = (pendingExposureByUnderlying[p.underlying] || 0) + notional;
+
+                // Place exits (mandatory) and monitors
+                const exits = await placeCustomBracketOrders({
+                    symbol: p.symbol,
+                    qty: p.qty,
+                    assetClass: p.assetClass,
+                    entryPrice
+                });
+                monitorOCO(exits.stopLossOrderId, exits.trailingStopOrderId, exits.takeProfitOrderId).catch(() => {});
+                if (!p.assetClass) {
+                    monitorBreakevenStop(p.symbol, entryPrice, exits.stopLossOrderId).catch(() => {});
+                }
+                log(p.assetClass ? "Option BUY" : "Equity BUY", p.symbol, "qty", p.qty, "avg", toDollars(entryPrice));
+
+                // Schedule non-profit exit
+                scheduleNonProfitExit({ symbol: p.symbol, assetClass: p.assetClass });
+            } catch (e) {
+                log("Buy error:", e?.message || e);
+            }
+        }));
+
+        // Next wave (if any residual budget remains)
+        waves++;
     }
 
     if (moneySpent + PARAMS.MIN_PRICE > PARAMS.MAX_PER_DAY) {

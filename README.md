@@ -65,3 +65,11 @@ Notes:
   - For every new trade (equity or option), the bot schedules a one-time check 10 minutes after the fill.
   - If the position has not produced a profit at that time (unrealized P/L <= 0), it cancels any open exits for that symbol and submits a market order to close the position.
   - This timeout is configurable via PARAMS.NON_PROFIT_TIMEOUT_MINUTES (default 10).
+- Iteration allocation and concurrency:
+  - On every iteration, the bot plans a batch of buys across the top-ranked tickers (by % change over the last 10 minutes) and submits them simultaneously.
+  - The combined batch is sized to use up all remaining buying power for the day, based on the initial buying power snapshot, while respecting:
+    - Per-trade/per-underlying cap: MAX_TRADE_PCT_OF_INITIAL_BP of the initial BP,
+    - Daily cap: MAX_PER_DAY,
+    - Liquidity cap: minute volume × price × SPEND_MULT.
+  - Options-first: For each ticker the bot first attempts to buy the nearest-expiry ITM call sized to its allocation; if that is not feasible, it falls back to equity.
+  - The bot may run additional mini-waves within the same iteration to consume any residual budget left after fills, until the remaining budget is below MIN_PRICE.
