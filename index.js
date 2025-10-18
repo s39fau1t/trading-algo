@@ -46,7 +46,9 @@ const PARAMS = {
         MINUTES: 30
     },
     // Minutes to look back for historical price comparison
-    LOOKBACK_MINUTES: 10
+    LOOKBACK_MINUTES: 10,
+    // Sell if not profitable after N minutes from entry
+    NON_PROFIT_TIMEOUT_MINUTES: 10
 };
 
 const ratelimiter = new Ratelimiter(RATELIMIT_MAX_REQ, RATELIMIT_TIMESPAN);
@@ -712,6 +714,85 @@ async function enforceOffHours() {
     }
 }
 
+// Track one-shot non-profit exit timers by exact traded symbol (equity or option contract)
+const nonProfitWatch = new Map(); // symbol -> { dueAt, timer, assetClass }
+
+// Cancel all open orders for a specific symbol (exits, etc.)
+async function cancelOpenOrdersForSymbol(symbol) {
+    try {
+        const openOrders = await request("orders", API.TRADE, { params: { status: "open" } });
+        const ours = (Array.isArray(openOrders) ? openOrders : []).filter(o => o.symbol === symbol);
+        await Promise.all(ours.map(o => request(`orders/${o.id}`, API.TRADE, { method: "DELETE" }).catch(() => {})));
+    } catch {
+        // ignore cancel errors
+    }
+}
+
+// One-shot check: if 10 minutes after entry the position is not profitable, close it
+async function checkAndExitNonProfit(symbol, assetClass) {
+    try {
+        // Clear watch on entry to avoid re-entry in case of long operations
+        const watch = nonProfitWatch.get(symbol);
+        if (watch) {
+            clearTimeout(watch.timer);
+            nonProfitWatch.delete(symbol);
+        }
+
+        // Find current position for this exact traded symbol
+        const positions = await request("positions", API.TRADE).catch(() => []);
+        const pos = (Array.isArray(positions) ? positions : []).find(p => p.symbol === symbol);
+        if (!pos) {
+            // Already exited via other exits; nothing to do
+            return;
+        }
+
+        const unrealized = parseFloat(pos.unrealized_pl ?? "0");
+        if (Number.isFinite(unrealized) && unrealized > 0) {
+            // It produced a profit at the checkpoint; keep running
+            log(`Non-profit check: ${symbol} is profitable (+${unrealized.toFixed(2)}). Holding.`);
+            return;
+        }
+
+        // Not profitable: cancel exits and close position at market
+        log(`Non-profit check: ${symbol} not profitable (${(unrealized || 0).toFixed(2)}). Closing position.`);
+        await cancelOpenOrdersForSymbol(symbol);
+
+        // Determine side and qty
+        const qty = toWholeQty(pos.qty);
+        if (qty > 0) {
+            const side = pos.side === "short" ? "buy" : "sell"; // Guard, though we only open longs
+            await request("orders", API.TRADE, {
+                method: "POST",
+                body: JSON.stringify(buildOrderBody({
+                    symbol,
+                    qty,
+                    side,
+                    type: "market",
+                    tif: "day",
+                    assetClass: assetClass === "option" ? "option" : undefined
+                }))
+            }).catch(e => log("Non-profit market close error:", e?.message || e));
+        }
+    } catch (e) {
+        log("Non-profit check error:", e?.message || e);
+    }
+}
+
+// Schedule a one-time non-profit exit check for a filled trade
+function scheduleNonProfitExit({ symbol, assetClass }) {
+    const minutes = PARAMS.NON_PROFIT_TIMEOUT_MINUTES ?? 10;
+    const timeoutMs = Math.max(1, minutes) * 60 * 1000;
+    // Cancel any prior watch for same symbol
+    const prev = nonProfitWatch.get(symbol);
+    if (prev) clearTimeout(prev.timer);
+
+    const timer = setTimeout(() => {
+        checkAndExitNonProfit(symbol, assetClass).catch(() => {});
+    }, timeoutMs);
+    nonProfitWatch.set(symbol, { dueAt: Date.now() + timeoutMs, timer, assetClass });
+    log(`Scheduled non-profit exit for ${symbol} in ${minutes} min.`);
+}
+
 async function algo() {
     log("Iteration start");
 
@@ -889,6 +970,10 @@ async function algo() {
                             // Fire-and-forget OCO monitoring
                             monitorOCO(exits.stopLossOrderId, exits.trailingStopOrderId, exits.takeProfitOrderId).catch(() => {});
                             log("Option BUY", contract.symbol, "qty", contractsQty, "avg", toDollars(entryPriceOpt));
+
+                            // Schedule non-profit exit in 10 minutes if not profitable
+                            scheduleNonProfitExit({ symbol: contract.symbol, assetClass: "option" });
+
                             traded = true;
                         }
                     }
@@ -947,6 +1032,9 @@ async function algo() {
         // Fire-and-forget breakeven stop monitor (equity only)
         monitorBreakevenStop(stock.symbol, entryPrice, exits.stopLossOrderId).catch(() => {});
         log("Equity BUY", stock.symbol, "qty", qty, "avg", toDollars(entryPrice));
+
+        // Schedule non-profit exit in 10 minutes if not profitable
+        scheduleNonProfitExit({ symbol: stock.symbol });
 
         // Guard: stop if we have no budget left for at least one more min trade
         remainingAlloc = toDollars(Math.max(0, initialBuyingPower - moneySpent - 5));

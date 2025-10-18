@@ -61,3 +61,7 @@ Notes:
 - Rate limiting: A simple token bucket (200 req/min) throttles all API calls.
 - Ensure your account has sufficient buying power and that paper trading is enabled.
 - Stop the program with Ctrl+C.
+- 10-minute non-profit exit:
+  - For every new trade (equity or option), the bot schedules a one-time check 10 minutes after the fill.
+  - If the position has not produced a profit at that time (unrealized P/L <= 0), it cancels any open exits for that symbol and submits a market order to close the position.
+  - This timeout is configurable via PARAMS.NON_PROFIT_TIMEOUT_MINUTES (default 10).
