@@ -214,6 +214,14 @@ function toWholeQty(x) {
     return Number.isFinite(q) && q > 0 ? q : 0;
 }
 
+// New: compute strict share-equivalent cap from minute volume (strictly < 5%)
+// For options, 1 contract = 100 share-equivalents (enforced downstream).
+function computeMaxShareEquivFromMinuteVolume(minuteVolume) {
+    const v = Math.floor((Number(minuteVolume) || 0) * 0.05);
+    // strictly less than 5%: subtract 1 if possible
+    return v > 0 ? v - 1 : 0;
+}
+
 // Build URL safely; handle arrays as comma‑separated (e.g., symbols=AAPL,TSLA)
 function buildURL(type, path, params = {}) {
     const url = new URL(`https://${type}.${API.DOMAIN}/${path}`);
@@ -794,7 +802,7 @@ function scheduleNonProfitExit({ symbol, assetClass }) {
 }
 
 // Add: helper to maximize spend using options + equity legs under the same cap
-async function planHybrid(stock, symbolCap) {
+async function planHybrid(stock, symbolCap, maxShareEquiv) {
     // Try to get nearest ITM call and its ask
     let contract = null;
     let optAsk = 0;
@@ -812,24 +820,35 @@ async function planHybrid(stock, symbolCap) {
 
     const legs = [];
     const equityUnit = Number(stock.ask) || 0;
-    const optUnit = optAsk > 0 ? optAsk * 100 : 0;
+    const optUnit = optAsk > 0 ? optAsk * 100 : 0; // option notional per contract
 
     if (!Number.isFinite(equityUnit) || equityUnit <= 0) return legs;
 
-    // Candidate A: shares-only
-    const sharesOnlyQty = toWholeQty(symbolCap / equityUnit);
+    // Enforce strict minute-volume cap by share-equivalents
+    let volCapShares = toWholeQty(maxShareEquiv);
+    if (volCapShares <= 0) return legs;
+
+    // Candidate A: shares-only (limited by dollars and volume)
+    const maxSharesByDollar = toWholeQty(symbolCap / equityUnit);
+    const maxSharesByVolume = volCapShares;
+    const sharesOnlyQty = Math.min(maxSharesByDollar, maxSharesByVolume);
     let bestSpend = toDollars(sharesOnlyQty * equityUnit);
     let best = { optQty: 0, shareQty: sharesOnlyQty, spend: bestSpend };
 
-    // Candidate B: options + shares (search around the greedy max contracts)
+    // Candidate B: options + shares (respect both dollars and combined share-equivalent cap)
     if (optUnit > 0 && symbolCap >= optUnit) {
-        const maxContracts = toWholeQty(symbolCap / optUnit);
-        // Evaluate a few candidates to avoid heavy search while capturing near-optimal combos
+        const maxContractsByDollar = toWholeQty(symbolCap / optUnit);
+        const maxContractsByVolume = toWholeQty(volCapShares / 100);
+        const maxContracts = Math.min(maxContractsByDollar, maxContractsByVolume);
+
+        // Evaluate a few candidates near the max to find a good fit
         const candidates = [maxContracts, Math.max(0, maxContracts - 1), Math.max(0, maxContracts - 2)];
         for (const k of candidates) {
             const spendOpt = k * optUnit;
-            const rem = Math.max(0, symbolCap - spendOpt);
-            const sh = toWholeQty(rem / equityUnit);
+            const remDollar = Math.max(0, symbolCap - spendOpt);
+            const remShareVol = Math.max(0, volCapShares - k * 100);
+
+            const sh = Math.min(toWholeQty(remDollar / equityUnit), remShareVol);
             const spend = toDollars(spendOpt + sh * equityUnit);
             if (spend > bestSpend) {
                 bestSpend = spend;
@@ -838,7 +857,7 @@ async function planHybrid(stock, symbolCap) {
         }
     }
 
-    // Build legs (option first if present, then equity)
+    // Build legs (ensure each leg is individually < 5% share-equivalents and combined too)
     if (best.optQty > 0 && contract?.symbol) {
         legs.push({
             symbol: contract.symbol,
@@ -943,7 +962,8 @@ async function algo() {
     // Replace single-leg planner with hybrid planner to maximize spend
     // Helper to plan one symbol (options + equity hybrid, maximizing spend <= symbolCap)
     const planOneHybrid = async (stock, symbolCap) => {
-        return await planHybrid(stock, symbolCap);
+        const maxShareEquiv = computeMaxShareEquivFromMinuteVolume(stock.volume);
+        return await planHybrid(stock, symbolCap, maxShareEquiv);
     };
 
     // Wave-based batch buying to consume remaining allocation in one iteration

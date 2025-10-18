@@ -48,6 +48,10 @@ Notes:
   - Exposure is tracked by underlying (equity + options market value) and includes pending allocations within the current batch.
   - Liquidity cap: minute volume × ask × SPEND_MULT.
   - Quantities are whole numbers only (whole shares and whole option contracts).
+- 5% current-volume cap (strict):
+  - Each planned trade is constrained to use strictly less than 5% of the stock’s current 1‑minute volume.
+  - For options, a contract counts as 100 share‑equivalents; the combined shares + (contracts × 100) stays strictly below 5% of the underlying stock’s current 1‑minute volume.
+  - If minute volume is too low, the trade is skipped.
 - Data feed and lookback:
   - Uses IEX feed for snapshots and 1-minute bars; percent change is computed versus approximately LOOKBACK_MINUTES ago.
 - Timing and scheduling:
@@ -60,4 +64,4 @@ Notes:
   - For every new trade (equity or option), a one-time check runs NON_PROFIT_TIMEOUT_MINUTES after fill; if unrealized P/L <= 0, open exits are canceled and the position is closed at market.
 - Iteration allocation and concurrency:
   - Each iteration plans a batch of buys and submits them concurrently, possibly in small waves to consume residual budget.
-  - Hybrid per-ticker planning may produce multiple legs (option + equity) for the same ticker within a batch to maximize spend while respecting exposure and liquidity caps.
+  - Hybrid per-ticker planning may produce multiple legs (option + equity) for the same ticker within a batch to maximize spend while respecting exposure and volume caps.
