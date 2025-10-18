@@ -37,7 +37,7 @@ Notes:
   - For each candidate symbol, the bot first attempts to buy the nearest-expiry ITM call contract (strike <= target) sized by available per-trade budget. If it can’t, it falls back to equity shares.
   - After a buy fills, it immediately places three exit legs:
     - Stop loss: stop order at STOP_PRICE_MULT of filled price.
-    - Trailing stop: trailing_stop with TRAILING_STOP_PERCENT.
+    - Trailing stop: trailing_stop with a fixed $0.50 trail (configurable via PARAMS.TRAILING_STOP_DOLLARS).
     - Take profit: limit order at TAKE_PROFIT_PERCENT above entry.
   - A background monitor cancels the two sibling exits when one exit fills (OCO-like behavior). Trailing stop placement is retried to improve reliability.
 - Breakeven stop adjustment (equities):

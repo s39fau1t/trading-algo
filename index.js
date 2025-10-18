@@ -34,8 +34,8 @@ const PARAMS = {
     LIMIT_PRICE_MULT: 1.1,
     //Multiplier to calculate the stop price (ask price * STOP_PRICE_MULT = stop_price)
     STOP_PRICE_MULT: 0.995,
-    //Percent away from the highest water mark for trailing stop orders
-    TRAILING_STOP_PERCENT: 1,
+    // Fixed dollar trailing amount for trailing stop orders
+    TRAILING_STOP_DOLLARS: 0.50,
     // Take profit percent above filled buy price (e.g., 5 = +5%)
     TAKE_PROFIT_PERCENT: 5,
     // Breakeven trigger: when price >= entry + delta, move stop to entry
@@ -639,11 +639,11 @@ async function placeCustomBracketOrders({ symbol, qty, assetClass, entryPrice })
             })
         );
 
-        // Emphasize reliability for trailing stop leg
+        // Emphasize reliability for trailing stop leg (now uses a fixed $ trail)
         trailingStopOrder = await placeOrderWithRetry(
             buildOrderBody({
                 symbol, qty, side: "sell", type: "trailing_stop", assetClass,
-                extra: { trail_percent: PARAMS.TRAILING_STOP_PERCENT }
+                extra: { trail_price: toDollars(PARAMS.TRAILING_STOP_DOLLARS || 0.5) }
             }),
             4 // extra retry for the trailing leg
         );
