@@ -40,6 +40,8 @@ Notes:
     - Trailing stop: trailing_stop with TRAILING_STOP_PERCENT.
     - Take profit: limit order at TAKE_PROFIT_PERCENT above entry.
   - A background monitor cancels the two sibling exits when one exit fills (OCO-like behavior). Trailing stop placement is retried to improve reliability.
+- Breakeven stop adjustment (equities):
+  - After an equity buy fills, if the stock’s price rises by $0.50 above the filled price, the bot automatically updates the stop loss to the entry price (breakeven) to prevent losses on that position. The delta is configurable via PARAMS.BREAKEVEN_TRIGGER_DELTA.
 - Exposure and sizing:
   - A single cap controls both per-trade spend and per-symbol exposure: MAX_TRADE_PCT_OF_INITIAL_BP (default 3% of the day’s initial buying power).
   - Per-symbol exposure cap is computed by underlying and includes both equity and options market value.

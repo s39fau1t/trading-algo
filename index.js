@@ -38,6 +38,8 @@ const PARAMS = {
     TRAILING_STOP_PERCENT: 1,
     // Take profit percent above filled buy price (e.g., 5 = +5%)
     TAKE_PROFIT_PERCENT: 5,
+    // Breakeven trigger: when price >= entry + delta, move stop to entry
+    BREAKEVEN_TRIGGER_DELTA: 0.50,
     //Time to cancel all orders and close out of all positions (24-hr, eastern time)
     CLOSING: {
         HOURS: 15,
@@ -551,6 +553,49 @@ async function monitorOCO(stopLossOrderId, trailingStopOrderId, takeProfitOrderI
     }
 }
 
+// Add: move stop to breakeven after $0.50 advance (equity only)
+async function monitorBreakevenStop(symbol, entryPrice, stopLossOrderId) {
+    try {
+        const trigger = toDollars(entryPrice + (PARAMS.BREAKEVEN_TRIGGER_DELTA ?? 0.5));
+        let done = false;
+
+        while (!done) {
+            // Stop if stop loss order is no longer active
+            const sl = await request(`orders/${stopLossOrderId}`, API.TRADE).catch(() => null);
+            if (!sl) break;
+
+            const status = sl.status;
+            const isActive = ["new", "accepted", "open", "partially_filled"].includes(status);
+            if (!isActive) break;
+
+            const currentStop = parseFloat(sl.stop_price ?? "0");
+            if (currentStop >= entryPrice - 1e-6) break; // already at/above breakeven
+
+            // Get latest equity quote (IEX)
+            const quoteResp = await request("stocks/quotes/latest", API.DATA, {
+                params: { symbols: symbol, feed: "iex" }
+            }).catch(() => null);
+
+            const q = quoteResp?.[symbol] || quoteResp?.latestQuote || quoteResp?.latestQuotes?.[symbol] || {};
+            const px = Number(q.ap ?? q.ask_price ?? 0);
+
+            if (px && px >= trigger) {
+                // Move stop to breakeven
+                await request(`orders/${stopLossOrderId}`, API.TRADE, {
+                    method: "PATCH",
+                    body: JSON.stringify({ stop_price: toDollars(entryPrice) })
+                }).catch(() => {});
+                log(`Breakeven stop set for ${symbol} at ${toDollars(entryPrice)} (triggered >= ${toDollars(trigger)})`);
+                break;
+            }
+
+            await new Promise(res => setTimeout(res, 3000));
+        }
+    } catch {
+        // swallow background errors
+    }
+}
+
 // Add: place order with retries (used to ensure trailing stop gets placed)
 async function placeOrderWithRetry(body, retries = 3, delayMs = 1500) {
     let lastErr;
@@ -899,6 +944,8 @@ async function algo() {
 
         // Fire-and-forget OCO monitoring
         monitorOCO(exits.stopLossOrderId, exits.trailingStopOrderId, exits.takeProfitOrderId).catch(() => {});
+        // Fire-and-forget breakeven stop monitor (equity only)
+        monitorBreakevenStop(stock.symbol, entryPrice, exits.stopLossOrderId).catch(() => {});
         log("Equity BUY", stock.symbol, "qty", qty, "avg", toDollars(entryPrice));
 
         // Guard: stop if we have no budget left for at least one more min trade
