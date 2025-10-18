@@ -793,6 +793,76 @@ function scheduleNonProfitExit({ symbol, assetClass }) {
     log(`Scheduled non-profit exit for ${symbol} in ${minutes} min.`);
 }
 
+// Add: helper to maximize spend using options + equity legs under the same cap
+async function planHybrid(stock, symbolCap) {
+    // Try to get nearest ITM call and its ask
+    let contract = null;
+    let optAsk = 0;
+    try {
+        const targetStrike = stock.ask * 0.95;
+        contract = await getNearestITMCallContract(stock.symbol, targetStrike);
+        if (contract?.symbol) {
+            const quotes = await request("options/quotes/latest", API.DATA, { params: { symbols: contract.symbol } });
+            const optQuote = quotes[contract.symbol] || quotes.latestQuote || quotes.latestQuotes?.[contract.symbol];
+            optAsk = Number(optQuote?.ap ?? optQuote?.ask_price ?? 0);
+        }
+    } catch {
+        // ignore option discovery errors
+    }
+
+    const legs = [];
+    const equityUnit = Number(stock.ask) || 0;
+    const optUnit = optAsk > 0 ? optAsk * 100 : 0;
+
+    if (!Number.isFinite(equityUnit) || equityUnit <= 0) return legs;
+
+    // Candidate A: shares-only
+    const sharesOnlyQty = toWholeQty(symbolCap / equityUnit);
+    let bestSpend = toDollars(sharesOnlyQty * equityUnit);
+    let best = { optQty: 0, shareQty: sharesOnlyQty, spend: bestSpend };
+
+    // Candidate B: options + shares (search around the greedy max contracts)
+    if (optUnit > 0 && symbolCap >= optUnit) {
+        const maxContracts = toWholeQty(symbolCap / optUnit);
+        // Evaluate a few candidates to avoid heavy search while capturing near-optimal combos
+        const candidates = [maxContracts, Math.max(0, maxContracts - 1), Math.max(0, maxContracts - 2)];
+        for (const k of candidates) {
+            const spendOpt = k * optUnit;
+            const rem = Math.max(0, symbolCap - spendOpt);
+            const sh = toWholeQty(rem / equityUnit);
+            const spend = toDollars(spendOpt + sh * equityUnit);
+            if (spend > bestSpend) {
+                bestSpend = spend;
+                best = { optQty: k, shareQty: sh, spend };
+            }
+        }
+    }
+
+    // Build legs (option first if present, then equity)
+    if (best.optQty > 0 && contract?.symbol) {
+        legs.push({
+            symbol: contract.symbol,
+            underlying: stock.symbol,
+            assetClass: "option",
+            qty: best.optQty,
+            estSpend: toDollars(best.optQty * optUnit),
+            entryAsk: optAsk
+        });
+    }
+    if (best.shareQty > 0) {
+        legs.push({
+            symbol: stock.symbol,
+            underlying: stock.symbol,
+            assetClass: undefined,
+            qty: best.shareQty,
+            estSpend: toDollars(best.shareQty * equityUnit),
+            entryAsk: equityUnit
+        });
+    }
+
+    return legs;
+}
+
 async function algo() {
     log("Iteration start");
 
@@ -870,49 +940,10 @@ async function algo() {
     const pendingExposureByUnderlying = {};
     const usedUnderlyings = new Set(); // avoid allocating same underlying twice in the same iteration
 
-    // Helper to plan one symbol (options-first, fallback equity)
-    const planOne = async (stock, symbolCap) => {
-        // Try options first
-        try {
-            const targetStrike = stock.ask * 0.95;
-            const contract = await getNearestITMCallContract(stock.symbol, targetStrike);
-            if (contract && contract.symbol) {
-                const quotes = await request("options/quotes/latest", API.DATA, { params: { symbols: contract.symbol } });
-                const optQuote = quotes[contract.symbol] || quotes.latestQuote || quotes.latestQuotes?.[contract.symbol];
-                const optAsk = optQuote?.ap || optQuote?.ask_price || 0;
-                if (optAsk > 0) {
-                    const contractsQty = toWholeQty(symbolCap / (optAsk * 100));
-                    if (contractsQty > 0) {
-                        const estSpend = toDollars(contractsQty * optAsk * 100);
-                        return {
-                            symbol: contract.symbol,
-                            underlying: stock.symbol,
-                            assetClass: "option",
-                            qty: contractsQty,
-                            estSpend,
-                            entryAsk: optAsk
-                        };
-                    }
-                }
-            }
-        } catch {
-            // ignore option plan errors
-        }
-
-        // Fallback: equity sizing
-        const qty = toWholeQty(symbolCap / stock.ask);
-        if (qty > 0) {
-            const estSpend = toDollars(qty * stock.ask);
-            return {
-                symbol: stock.symbol,
-                underlying: stock.symbol,
-                assetClass: undefined,
-                qty,
-                estSpend,
-                entryAsk: stock.ask
-            };
-        }
-        return null;
+    // Replace single-leg planner with hybrid planner to maximize spend
+    // Helper to plan one symbol (options + equity hybrid, maximizing spend <= symbolCap)
+    const planOneHybrid = async (stock, symbolCap) => {
+        return await planHybrid(stock, symbolCap);
     };
 
     // Wave-based batch buying to consume remaining allocation in one iteration
@@ -925,8 +956,9 @@ async function algo() {
         const batchPlans = [];
 
         for (const stock of stocks) {
-            // Skip if underlying already traded today or already allocated this iteration
-            if (tradedSymbolsToday.has(stock.symbol) || usedUnderlyings.has(stock.symbol)) continue;
+            // Allow re-trading the same symbol across iterations/day if capacity remains
+            // Only avoid double planning in the same iteration wave
+            if (usedUnderlyings.has(stock.symbol)) continue;
 
             // Combined exposure capacity for this underlying (existing + pending)
             const currentMV = toDollars((exposureByUnderlying[stock.symbol] || 0) + (pendingExposureByUnderlying[stock.symbol] || 0));
@@ -947,16 +979,20 @@ async function algo() {
             symbolCap = toDollars(Math.max(0, symbolCap));
             if (symbolCap < PARAMS.MIN_PRICE) continue;
 
-            // Build plan (try options first)
-            const plan = await planOne(stock, symbolCap);
-            if (!plan) continue;
+            // Build hybrid plan (options + equity) to maximize spend under this cap
+            const plans = await planOneHybrid(stock, symbolCap);
+            if (!plans || plans.length === 0) continue;
 
-            // Reserve capacity and budget for this plan
-            batchPlans.push(plan);
+            // Total reserved spend for this underlying in this iteration
+            const totalSpend = toDollars(plans.reduce((s, p) => s + p.estSpend, 0));
+            if (totalSpend < PARAMS.MIN_PRICE) continue;
+
+            // Reserve capacity and budget for these legs
+            for (const pl of plans) batchPlans.push(pl);
             usedUnderlyings.add(stock.symbol);
-            pendingExposureByUnderlying[stock.symbol] = (pendingExposureByUnderlying[stock.symbol] || 0) + plan.estSpend;
-            remainingAlloc = toDollars(Math.max(0, remainingAlloc - plan.estSpend));
-            dailyRemainingNow = toDollars(Math.max(0, dailyRemainingNow - plan.estSpend));
+            pendingExposureByUnderlying[stock.symbol] = (pendingExposureByUnderlying[stock.symbol] || 0) + totalSpend;
+            remainingAlloc = toDollars(Math.max(0, remainingAlloc - totalSpend));
+            dailyRemainingNow = toDollars(Math.max(0, dailyRemainingNow - totalSpend));
 
             if (remainingAlloc < PARAMS.MIN_PRICE || dailyRemainingNow < PARAMS.MIN_PRICE) break;
         }
@@ -996,8 +1032,7 @@ async function algo() {
 
                 // Update budgets and bookkeeping
                 moneySpent += notional;
-                tradedSymbolsToday.add(p.underlying);
-                pendingExposureByUnderlying[p.underlying] = (pendingExposureByUnderlying[p.underlying] || 0) + notional;
+                // pendingExposureByUnderlying already reserved above; no need to add again
 
                 // Place exits (mandatory) and monitors
                 const exits = await placeCustomBracketOrders({
