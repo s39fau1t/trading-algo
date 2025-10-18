@@ -802,7 +802,8 @@ function scheduleNonProfitExit({ symbol, assetClass }) {
 }
 
 // Add: helper to maximize spend using options + equity legs under the same cap
-async function planHybrid(stock, symbolCap, maxShareEquiv) {
+// NOTE: options ignore minute-volume caps; stocks must obey them.
+async function planHybrid(stock, baseCap, sharesCap, maxShareEquiv) {
     // Try to get nearest ITM call and its ask
     let contract = null;
     let optAsk = 0;
@@ -821,34 +822,32 @@ async function planHybrid(stock, symbolCap, maxShareEquiv) {
     const legs = [];
     const equityUnit = Number(stock.ask) || 0;
     const optUnit = optAsk > 0 ? optAsk * 100 : 0; // option notional per contract
-
     if (!Number.isFinite(equityUnit) || equityUnit <= 0) return legs;
 
-    // Enforce strict minute-volume cap by share-equivalents
-    let volCapShares = toWholeQty(maxShareEquiv);
-    if (volCapShares <= 0) return legs;
+    // Strict 5% minute-volume cap applies only to shares
+    const volCapShares = toWholeQty(maxShareEquiv);
+    if (volCapShares <= 0 && optUnit <= 0) return legs;
 
-    // Candidate A: shares-only (limited by dollars and volume)
-    const maxSharesByDollar = toWholeQty(symbolCap / equityUnit);
+    // Shares-only candidate (limited by dollars and share-volume cap)
+    const maxSharesByDollar = toWholeQty((sharesCap || 0) / equityUnit);
     const maxSharesByVolume = volCapShares;
     const sharesOnlyQty = Math.min(maxSharesByDollar, maxSharesByVolume);
     let bestSpend = toDollars(sharesOnlyQty * equityUnit);
     let best = { optQty: 0, shareQty: sharesOnlyQty, spend: bestSpend };
 
-    // Candidate B: options + shares (respect both dollars and combined share-equivalent cap)
-    if (optUnit > 0 && symbolCap >= optUnit) {
-        const maxContractsByDollar = toWholeQty(symbolCap / optUnit);
-        const maxContractsByVolume = toWholeQty(volCapShares / 100);
-        const maxContracts = Math.min(maxContractsByDollar, maxContractsByVolume);
+    // Options candidate(s): options are NOT volume-limited; only dollar/base caps apply
+    if (optUnit > 0 && baseCap >= optUnit) {
+        const maxContractsByDollar = toWholeQty(baseCap / optUnit);
+        const candidates = [maxContractsByDollar, Math.max(0, maxContractsByDollar - 1), Math.max(0, maxContractsByDollar - 2)];
 
-        // Evaluate a few candidates near the max to find a good fit
-        const candidates = [maxContracts, Math.max(0, maxContracts - 1), Math.max(0, maxContracts - 2)];
         for (const k of candidates) {
             const spendOpt = k * optUnit;
-            const remDollar = Math.max(0, symbolCap - spendOpt);
-            const remShareVol = Math.max(0, volCapShares - k * 100);
+            const remDollar = Math.max(0, baseCap - spendOpt);
 
-            const sh = Math.min(toWholeQty(remDollar / equityUnit), remShareVol);
+            // Shares still must obey share cap AND share-volume cap
+            const sharesDollarRoom = Math.min(remDollar, sharesCap || 0);
+            const sh = Math.min(toWholeQty(sharesDollarRoom / equityUnit), volCapShares);
+
             const spend = toDollars(spendOpt + sh * equityUnit);
             if (spend > bestSpend) {
                 bestSpend = spend;
@@ -857,7 +856,7 @@ async function planHybrid(stock, symbolCap, maxShareEquiv) {
         }
     }
 
-    // Build legs (ensure each leg is individually < 5% share-equivalents and combined too)
+    // Build legs (shares obey volume cap; options do not)
     if (best.optQty > 0 && contract?.symbol) {
         legs.push({
             symbol: contract.symbol,
@@ -903,28 +902,22 @@ async function getLatestOptionAsk(optionSymbol) {
 }
 
 // New: revalidate and cap qty for a single trade right before sending the buy
+// Options: only per-trade dollar cap applies (no minute-volume cap).
+// Stocks: keep strict 5% minute-volume cap.
 async function revalidateAndCapQtyBeforeBuy(plan, perTradeCap) {
     if (plan.assetClass === "option") {
-        const underlying = plan.underlying || getUnderlyingFromOptionSymbol(plan.symbol);
-        const snap = await getLatestSnapshot(underlying);
-        const minuteVol = Number(snap?.minuteBar?.v ?? 0);
-        const volCapShares = computeMaxShareEquivFromMinuteVolume(minuteVol);
-        const maxByVol = toWholeQty(volCapShares / 100);
-
         let ask = await getLatestOptionAsk(plan.symbol);
         if (!ask) ask = Number(plan.entryAsk || 0);
         const unit = ask * 100;
         const maxByDollar = unit > 0 ? toWholeQty(perTradeCap / unit) : 0;
-
-        const capped = Math.min(plan.qty, maxByVol, maxByDollar);
-        return { qty: toWholeQty(capped), latestAsk: ask, minuteVol };
+        const capped = Math.min(plan.qty, maxByDollar);
+        return { qty: toWholeQty(capped), latestAsk: ask, minuteVol: 0 };
     } else {
         const snap = await getLatestSnapshot(plan.symbol);
         const minuteVol = Number(snap?.minuteBar?.v ?? 0);
         const ask = Number(snap?.latestQuote?.ap ?? plan.entryAsk ?? 0);
         const volCapShares = computeMaxShareEquivFromMinuteVolume(minuteVol);
         const maxByDollar = ask > 0 ? toWholeQty(perTradeCap / ask) : 0;
-
         const capped = Math.min(plan.qty, volCapShares, maxByDollar);
         return { qty: toWholeQty(capped), latestAsk: ask, minuteVol };
     }
@@ -1008,10 +1001,9 @@ async function algo() {
     const usedUnderlyings = new Set(); // avoid allocating same underlying twice in the same iteration
 
     // Replace single-leg planner with hybrid planner to maximize spend
-    // Helper to plan one symbol (options + equity hybrid, maximizing spend <= symbolCap)
-    const planOneHybrid = async (stock, symbolCap) => {
+    const planOneHybrid = async (stock, baseCap, sharesCap) => {
         const maxShareEquiv = computeMaxShareEquivFromMinuteVolume(stock.volume);
-        return await planHybrid(stock, symbolCap, maxShareEquiv);
+        return await planHybrid(stock, baseCap, sharesCap, maxShareEquiv);
     };
 
     // Wave-based batch buying to consume remaining allocation in one iteration
@@ -1033,22 +1025,23 @@ async function algo() {
             const exposureCapacity = Math.max(0, toDollars(perTradeCap - currentMV));
             if (exposureCapacity < PARAMS.MIN_PRICE) continue;
 
-            // Liquidity cap (minute volume * price * SPEND_MULT)
-            const volumeCap = toDollars(stock.volume * stock.ask * PARAMS.SPEND_MULT);
+            // Liquidity cap for shares only (minute volume × price × SPEND_MULT)
+            const sharesLiquidityCap = toDollars(stock.volume * stock.ask * PARAMS.SPEND_MULT);
 
-            // Budget available for this symbol within this wave
-            let symbolCap = Math.min(
+            // Base cap for both legs (budgets/exposure/per-trade), options are NOT limited by liquidity cap
+            const baseCap = Math.min(
                 remainingAlloc,
                 dailyRemainingNow,
                 exposureCapacity,
-                volumeCap,
                 perTradeCap
             );
-            symbolCap = toDollars(Math.max(0, symbolCap));
-            if (symbolCap < PARAMS.MIN_PRICE) continue;
+            const sharesCap = Math.min(baseCap, sharesLiquidityCap);
 
-            // Build hybrid plan (options + equity) to maximize spend under this cap
-            const plans = await planOneHybrid(stock, symbolCap);
+            let symbolCap = toDollars(Math.max(0, baseCap));
+            if (symbolCap < PARAMS.MIN_PRICE && sharesCap < PARAMS.MIN_PRICE) continue;
+
+            // Build hybrid plan (options + equity). Shares limited by sharesCap; options by baseCap.
+            const plans = await planOneHybrid(stock, symbolCap, sharesCap);
             if (!plans || plans.length === 0) continue;
 
             // Total reserved spend for this underlying in this iteration
