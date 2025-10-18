@@ -882,6 +882,54 @@ async function planHybrid(stock, symbolCap, maxShareEquiv) {
     return legs;
 }
 
+// New: fetch latest snapshot for a single symbol (IEX)
+async function getLatestSnapshot(symbol) {
+    const resp = await request("stocks/snapshots", API.DATA, {
+        params: { symbols: symbol, feed: "iex" }
+    });
+    const snaps = normalizeSnapshots(resp);
+    return snaps?.[symbol] || null;
+}
+
+// New: fetch latest option ask for a single contract
+async function getLatestOptionAsk(optionSymbol) {
+    try {
+        const quotes = await request("options/quotes/latest", API.DATA, { params: { symbols: optionSymbol } });
+        const q = quotes?.[optionSymbol] || quotes?.latestQuote || quotes?.latestQuotes?.[optionSymbol] || {};
+        return Number(q.ap ?? q.ask_price ?? 0) || 0;
+    } catch {
+        return 0;
+    }
+}
+
+// New: revalidate and cap qty for a single trade right before sending the buy
+async function revalidateAndCapQtyBeforeBuy(plan, perTradeCap) {
+    if (plan.assetClass === "option") {
+        const underlying = plan.underlying || getUnderlyingFromOptionSymbol(plan.symbol);
+        const snap = await getLatestSnapshot(underlying);
+        const minuteVol = Number(snap?.minuteBar?.v ?? 0);
+        const volCapShares = computeMaxShareEquivFromMinuteVolume(minuteVol);
+        const maxByVol = toWholeQty(volCapShares / 100);
+
+        let ask = await getLatestOptionAsk(plan.symbol);
+        if (!ask) ask = Number(plan.entryAsk || 0);
+        const unit = ask * 100;
+        const maxByDollar = unit > 0 ? toWholeQty(perTradeCap / unit) : 0;
+
+        const capped = Math.min(plan.qty, maxByVol, maxByDollar);
+        return { qty: toWholeQty(capped), latestAsk: ask, minuteVol };
+    } else {
+        const snap = await getLatestSnapshot(plan.symbol);
+        const minuteVol = Number(snap?.minuteBar?.v ?? 0);
+        const ask = Number(snap?.latestQuote?.ap ?? plan.entryAsk ?? 0);
+        const volCapShares = computeMaxShareEquivFromMinuteVolume(minuteVol);
+        const maxByDollar = ask > 0 ? toWholeQty(perTradeCap / ask) : 0;
+
+        const capped = Math.min(plan.qty, volCapShares, maxByDollar);
+        return { qty: toWholeQty(capped), latestAsk: ask, minuteVol };
+    }
+}
+
 async function algo() {
     log("Iteration start");
 
@@ -1022,9 +1070,21 @@ async function algo() {
         // Execute all planned buys concurrently
         await Promise.all(batchPlans.map(async (p) => {
             try {
+                // New: revalidate per-trade constraints right before placing the order
+                const cap = toDollars(initialBuyingPower * PARAMS.MAX_TRADE_PCT_OF_INITIAL_BP);
+                const { qty: cappedQty } = await revalidateAndCapQtyBeforeBuy(p, cap);
+
+                if (!cappedQty || cappedQty <= 0) {
+                    log(`Skip ${p.symbol}: qty ${p.qty} -> 0 (per-trade or volume cap)`);
+                    return;
+                }
+                if (cappedQty !== p.qty) {
+                    log(`Cap ${p.symbol}: qty ${p.qty} -> ${cappedQty} (per-trade/volume)`);
+                }
+
                 const body = {
                     symbol: p.symbol,
-                    qty: p.qty,
+                    qty: cappedQty,
                     side: "buy",
                     type: "market",
                     time_in_force: "day",
@@ -1047,8 +1107,8 @@ async function algo() {
                 // Compute actual spend
                 const entryPrice = parseFloat(filled.filled_avg_price || p.entryAsk);
                 const notional = p.assetClass === "option"
-                    ? toDollars(p.qty * entryPrice * 100)
-                    : toDollars(p.qty * entryPrice);
+                    ? toDollars(cappedQty * entryPrice * 100)
+                    : toDollars(cappedQty * entryPrice);
 
                 // Update budgets and bookkeeping
                 moneySpent += notional;
@@ -1057,7 +1117,7 @@ async function algo() {
                 // Place exits (mandatory) and monitors
                 const exits = await placeCustomBracketOrders({
                     symbol: p.symbol,
-                    qty: p.qty,
+                    qty: cappedQty,
                     assetClass: p.assetClass,
                     entryPrice
                 });
@@ -1065,7 +1125,7 @@ async function algo() {
                 if (!p.assetClass) {
                     monitorBreakevenStop(p.symbol, entryPrice, exits.stopLossOrderId).catch(() => {});
                 }
-                log(p.assetClass ? "Option BUY" : "Equity BUY", p.symbol, "qty", p.qty, "avg", toDollars(entryPrice));
+                log(p.assetClass ? "Option BUY" : "Equity BUY", p.symbol, "qty", cappedQty, "avg", toDollars(entryPrice));
 
                 // Schedule non-profit exit
                 scheduleNonProfitExit({ symbol: p.symbol, assetClass: p.assetClass });

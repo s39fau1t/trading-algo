@@ -48,10 +48,12 @@ Notes:
   - Exposure is tracked by underlying (equity + options market value) and includes pending allocations within the current batch.
   - Liquidity cap: minute volume × ask × SPEND_MULT.
   - Quantities are whole numbers only (whole shares and whole option contracts).
+  - Per-order enforcement: every buy order is capped so its notional is <= MAX_TRADE_PCT_OF_INITIAL_BP × initial buying power.
 - 5% current-volume cap (strict):
   - Each planned trade is constrained to use strictly less than 5% of the stock’s current 1‑minute volume.
   - For options, a contract counts as 100 share‑equivalents; the combined shares + (contracts × 100) stays strictly below 5% of the underlying stock’s current 1‑minute volume.
   - If minute volume is too low, the trade is skipped.
+  - Per-order enforcement: right before each buy is submitted, the order quantity is revalidated and capped so that the single order is strictly below the 5% minute‑volume limit.
 - Data feed and lookback:
   - Uses IEX feed for snapshots and 1-minute bars; percent change is computed versus approximately LOOKBACK_MINUTES ago.
 - Timing and scheduling:
