@@ -53,9 +53,9 @@ Notes:
   - Per-order enforcement: every buy order is capped so its notional is <= MAX_TRADE_PCT_OF_INITIAL_BP × initial buying power.
 - 5% current-volume cap (stocks only):
   - Equity orders must be strictly less than 5% of the stock’s current 1‑minute volume.
+  - When the 5% calculation resolves to 0 shares (e.g., thin symbols early in the minute), a small configurable floor MINUTE_VOL_CAP_MIN_FLOOR_SHARES is allowed to avoid 0‑share blocks. Set it to 0 to disable this behavior.
   - Option contracts are NOT constrained by current-minute volume; they only adhere to MAX_TRADE_PCT_OF_INITIAL_BP.
-  - If minute volume is too low, equity trades are skipped.
-  - Per-order enforcement: right before each equity buy is submitted, the order quantity is revalidated and capped so that the single order is strictly below the 5% minute‑volume limit.
+  - Per-order enforcement: right before each equity buy is submitted, the order quantity is revalidated and capped so that the single order adheres to the minute-volume rule or the configured floor, whichever applies.
 - Data feed and lookback:
   - Uses IEX feed for snapshots and 1-minute bars; percent change is computed versus approximately LOOKBACK_MINUTES ago.
 - Timing and scheduling:
@@ -87,6 +87,7 @@ Configuration quick reference (index.js PARAMS):
 - CLOSING: Enforced flat time (ET). Default: 15:30.
 - LOOKBACK_MINUTES: Minutes to look back for momentum. Default: 10 (sets start time to 9:30 + LOOKBACK_MINUTES).
 - NON_PROFIT_TIMEOUT_MINUTES: Minutes after fill to close if P/L <= 0. Default: 10.
+- MINUTE_VOL_CAP_MIN_FLOOR_SHARES: Minimum share-equivalent cap if the strict 5% rule yields 0. Default: 3 (set to 0 to disable).
 
 Operational tips:
 - Use "dump" any time to flatten immediately and pause trading; the bot stays running.

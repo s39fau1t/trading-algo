@@ -50,7 +50,10 @@ const PARAMS = {
     // Minutes to look back for historical price comparison
     LOOKBACK_MINUTES: 10,
     // Sell if not profitable after N minutes from entry
-    NON_PROFIT_TIMEOUT_MINUTES: 10
+    NON_PROFIT_TIMEOUT_MINUTES: 10,
+    // Minimum share-equivalent cap when 5% of current minute volume yields 0.
+    // Set to 0 to disable the floor entirely.
+    MINUTE_VOL_CAP_MIN_FLOOR_SHARES: 3
 };
 
 // Replace single limiter instance
@@ -314,9 +317,17 @@ function toWholeQty(x) {
 // New: compute strict share-equivalent cap from minute volume (strictly < 5%)
 // For options, 1 contract = 100 share-equivalents (enforced downstream).
 function computeMaxShareEquivFromMinuteVolume(minuteVolume) {
-    const v = Math.floor((Number(minuteVolume) || 0) * 0.05);
+    const mv = Math.max(0, Math.floor(Number(minuteVolume) || 0));
+    let v = Math.floor(mv * 0.05);
     // strictly less than 5%: subtract 1 if possible
-    return v > 0 ? v - 1 : 0;
+    if (v > 0) v = v - 1;
+
+    // Apply configurable floor if 5% resolves to 0
+    const floor = toWholeQty(PARAMS.MINUTE_VOL_CAP_MIN_FLOOR_SHARES ?? 0);
+    if (v <= 0 && floor > 0) {
+        return floor;
+    }
+    return toWholeQty(v);
 }
 
 // Build URL safely; handle arrays as comma‑separated (e.g., symbols=AAPL,TSLA)
