@@ -8,22 +8,22 @@ export default class Ratelimiter {
     }
 
     consume() {
-        return new Promise(resolve => {
-            const curTime = Date.now();
+        return new Promise((resolve) => {
+            const now = Date.now();
 
-            if(curTime - this.start >= this.timeSpan) {
-                this.start = curTime;
+            if (now - this.start >= this.timeSpan) {
+                this.start = now;
                 this.tokens = 0;
             }
 
-            if(++this.tokens <= this.maxTokens) {
+            if (++this.tokens <= this.maxTokens) {
                 resolve();
-            }else {
+            } else {
+                const delay = Math.max(0, this.start + this.timeSpan - now);
                 setTimeout(() => {
-                    this.consume();
-
-                    resolve();
-                }, this.start + this.timeSpan - curTime);
+                    // Retry after window resets; resolve only when allowed
+                    this.consume().then(resolve);
+                }, delay);
             }
         });
     }

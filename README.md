@@ -65,75 +65,16 @@ Notes:
 - 10-minute non-profit exit:
   - For every new trade (equity or option), a one-time check runs NON_PROFIT_TIMEOUT_MINUTES after fill; if unrealized P/L <= 0, open exits are canceled and the position is closed at market.
 - Iteration allocation and concurrency:
-  - Each iteration plans a batch of buys and submits them concurrently, possibly in small waves to consume residual budget.
-  - Hybrid per-ticker planning may produce multiple legs (option + equity) for the same ticker within a batch to maximize spend while respecting exposure and volume caps.
-
-- What this bot does (high level):
-  - Every iteration (~30s by default), the bot:
-    - Enforces off-hours (flat state from 3:30 PM ET until market open + LOOKBACK_MINUTES, default 9:40 AM ET).
-    - Fetches NYSE equities, snapshots (IEX), and 1‑min bars to compute % change vs ~LOOKBACK_MINUTES ago.
-    - Ranks candidates by momentum and plans buys under strict spend/exposure/liquidity constraints.
-    - Places market buys in small waves; for each fill, immediately places three exits: stop, trailing stop ($), and take profit. Monitors OCO and breakeven stop adjustments.
-    - Schedules a one‑time “non‑profit” check 10 minutes after fill; if <= 0 P/L at that time, closes the position at market.
-
-- Trading window:
-  - The bot only places trades starting at market open + LOOKBACK_MINUTES.
-  - Default start time is 9:40 AM ET (9:30 + 10 min).
-
-- Off-hours enforcement (strict, cannot be overridden by "pump"):
-  - From 3:30 PM ET until the next trading start time, the bot enforces a flat state:
-    - Positions are closed first, then any remaining open orders are canceled.
-    - No new positions or open orders are allowed.
-    - "pump" has no effect during this window; trading auto-resumes at the next start time.
-
-- Hybrid options + equity with custom exits:
-  - Per candidate ticker, the planner maximizes dollar spend under the smallest of:
-    - Per-ticker exposure cap (MAX_TRADE_PCT_OF_INITIAL_BP × initial buying power),
-    - Daily remaining budget,
-    - Liquidity cap (minute volume × ask × SPEND_MULT).
-  - It tries a near‑ITM call (nearest expiry, strike <= target) and combines contracts with shares to best fit caps (whole quantities only). Falls back to shares-only if options are not viable.
-  - After a buy fill, three exit legs are placed:
-    - Stop loss: stop at STOP_PRICE_MULT of entry.
-    - Trailing stop: trailing_stop with fixed $ trail (TRAILING_STOP_DOLLARS).
-    - Take profit: limit at TAKE_PROFIT_PERCENT above entry.
-  - An OCO monitor cancels siblings when one fills; trailing stop placement is retried to improve reliability.
-
-- Breakeven stop adjustment (equities only):
-  - After an equity buy fills, if price advances by BREAKEVEN_TRIGGER_DELTA above entry, the stop loss is moved up to breakeven.
-
-- Exposure and sizing:
-  - One cap governs both per-trade spend and per-symbol exposure: MAX_TRADE_PCT_OF_INITIAL_BP, measured against the day’s initial buying power (not current cash).
-  - Exposure is tracked by underlying symbol and includes options market value. Pending allocations within the current batch are accounted for to avoid oversizing.
-  - Liquidity cap: minute volume × ask × SPEND_MULT (applies to equity shares only; options ignore volume-based caps).
-  - Whole quantities only (whole shares and whole option contracts).
-  - Per-order enforcement: right before each buy, the quantity is revalidated and capped so that a single order never exceeds:
-    - Per-trade dollar cap (MAX_TRADE_PCT_OF_INITIAL_BP × initial BP), and
-    - For equities only, the strict 5% minute-volume limit below.
-
-- 5% current-minute volume cap (stocks only):
-  - Equity trades obey a strict limit: share quantity must be strictly less than 5% of the stock’s current 1‑minute volume.
-  - Options are exempt from minute-volume constraints and only respect the per‑trade dollar cap.
-  - If minute volume is too low, the equity trade is skipped.
-
-- Data feed and lookback:
-  - Uses IEX feed for snapshots and 1‑minute bars.
-  - Percent change is computed versus a bar closest to ~LOOKBACK_MINUTES ago.
-
-- Timing and scheduling:
-  - All scheduling uses US/Eastern time.
-  - Cleanup scheduler triggers at 3:30 PM ET to flatten positions first, then cancel orders.
-  - Off-hours checks also run each iteration to keep the account flat during off-hours.
-  - Default iteration interval is 30 seconds (PARAMS.INTERVAL). The terminal shows a countdown; interactive mode prevents overwriting typed input.
-
-- Iteration allocation and concurrency:
-  - Each iteration plans a batch of buys and submits them concurrently, in up to 3 small “waves” to consume residual budget.
+  - Each iteration plans a batch of buys and submits them in paced “waves” to consume residual budget.
   - Hybrid per‑ticker planning may produce multiple legs (option + equity) for the same ticker in a single iteration.
+  - The bot continues waves within the same iteration until remaining buying power (and the daily cap) are exhausted or no further viable trades exist, while respecting API rate limits.
 
 - 10-minute non-profit exit:
   - For every new trade (equity or option), a one-time check runs NON_PROFIT_TIMEOUT_MINUTES after fill; if unrealized P/L <= 0, open exits are canceled and the position is closed at market.
 
 - Rate limiting:
-  - A token bucket throttles all API calls to 200 requests per minute.
+  - Dual token buckets throttle all API calls to both 10 requests/second and 200 requests/minute.
+  - Trade submission per wave is sequentially paced to avoid bursty traffic; iterations still run as fast as the limits allow.
 
 - Logging and terminal UX:
   - Logs include ET timestamps.

@@ -15,8 +15,11 @@ const API = Object.freeze({
     DATA: "data"
 });
 
-const RATELIMIT_MAX_REQ = 200;
-const RATELIMIT_TIMESPAN = 1 * 60 * 1000;
+// Replace single limiter with dual: 10 req/s and 200 req/min
+const RL_PER_MIN_MAX = 200;
+const RL_PER_MIN_SPAN = 60 * 1000;
+const RL_PER_SEC_MAX = 10;
+const RL_PER_SEC_SPAN = 1000;
 
 const PARAMS = {
     //Interval between each iteration of the algo (ms)
@@ -51,7 +54,9 @@ const PARAMS = {
     NON_PROFIT_TIMEOUT_MINUTES: 10
 };
 
-const ratelimiter = new Ratelimiter(RATELIMIT_MAX_REQ, RATELIMIT_TIMESPAN);
+// Replace single limiter instance
+const rateLimiterPerMinute = new Ratelimiter(RL_PER_MIN_MAX, RL_PER_MIN_SPAN);
+const rateLimiterPerSecond = new Ratelimiter(RL_PER_SEC_MAX, RL_PER_SEC_SPAN);
 
 // Add: readline interface handle
 let rl = null;
@@ -269,8 +274,8 @@ async function request(path, type, options = {
     params: {},
     body: null
 }) {
-    await ratelimiter.consume();
-
+    // Enforce both 10 rps and 200 rpm
+    await Promise.all([rateLimiterPerSecond.consume(), rateLimiterPerMinute.consume()]);
     return await noRatelimitRequest(path, type, options);
 }
 
@@ -1008,7 +1013,7 @@ async function algo() {
 
     // Wave-based batch buying to consume remaining allocation in one iteration
     let waves = 0;
-    while (waves < 3) { // up to 3 waves to consume residuals
+    while (true) { // keep going until budget is exhausted or no more viable plans
         let remainingAlloc = toDollars(Math.max(0, initialBuyingPower - moneySpent - 5));
         let dailyRemainingNow = toDollars(Math.max(0, PARAMS.MAX_PER_DAY - moneySpent));
         if (remainingAlloc < PARAMS.MIN_PRICE || dailyRemainingNow < PARAMS.MIN_PRICE) break;
@@ -1060,16 +1065,15 @@ async function algo() {
 
         if (batchPlans.length === 0) break;
 
-        // Execute all planned buys concurrently
-        await Promise.all(batchPlans.map(async (p) => {
+        // Execute planned buys sequentially to avoid bursts, still fast under dual limiter
+        for (const p of batchPlans) {
             try {
-                // New: revalidate per-trade constraints right before placing the order
                 const cap = toDollars(initialBuyingPower * PARAMS.MAX_TRADE_PCT_OF_INITIAL_BP);
                 const { qty: cappedQty } = await revalidateAndCapQtyBeforeBuy(p, cap);
 
                 if (!cappedQty || cappedQty <= 0) {
                     log(`Skip ${p.symbol}: qty ${p.qty} -> 0 (per-trade or volume cap)`);
-                    return;
+                    continue;
                 }
                 if (cappedQty !== p.qty) {
                     log(`Cap ${p.symbol}: qty ${p.qty} -> ${cappedQty} (per-trade/volume)`);
@@ -1085,29 +1089,32 @@ async function algo() {
                 };
                 const buyOrder = await request("orders", API.TRADE, { method: "POST", body: JSON.stringify(body) });
 
-                // Wait for fill
+                // Wait for fill with a short exponential backoff (up to ~30s total)
                 let filled = null;
-                for (let i = 0; i < 10; i++) {
+                let delay = 1000;
+                for (let i = 0; i < 8; i++) {
                     const st = await request(`orders/${buyOrder.id}`, API.TRADE);
                     if (st.status === "filled") { filled = st; break; }
-                    await new Promise(res => setTimeout(res, 2000));
+                    await new Promise(res => setTimeout(res, delay));
+                    delay = Math.min(8000, Math.floor(delay * 1.6));
+                }
+                if (!filled) {
+                    // As a fallback, one last check before giving up
+                    const st = await request(`orders/${buyOrder.id}`, API.TRADE);
+                    if (st.status === "filled") filled = st;
                 }
                 if (!filled) {
                     log(`Buy not filled in time: ${p.symbol}`);
-                    return;
+                    continue;
                 }
 
-                // Compute actual spend
                 const entryPrice = parseFloat(filled.filled_avg_price || p.entryAsk);
                 const notional = p.assetClass === "option"
                     ? toDollars(cappedQty * entryPrice * 100)
                     : toDollars(cappedQty * entryPrice);
 
-                // Update budgets and bookkeeping
                 moneySpent += notional;
-                // pendingExposureByUnderlying already reserved above; no need to add again
 
-                // Place exits (mandatory) and monitors
                 const exits = await placeCustomBracketOrders({
                     symbol: p.symbol,
                     qty: cappedQty,
@@ -1125,10 +1132,10 @@ async function algo() {
             } catch (e) {
                 log("Buy error:", e?.message || e);
             }
-        }));
+        }
 
-        // Next wave (if any residual budget remains)
         waves++;
+        // loop re-evaluates remainingAlloc/dailyRemainingNow; will exit when exhausted or no plans left
     }
 
     if (moneySpent + PARAMS.MIN_PRICE > PARAMS.MAX_PER_DAY) {
