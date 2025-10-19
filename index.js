@@ -909,7 +909,9 @@ async function planHybrid(stock, baseCap, sharesCap, maxShareEquiv) {
 
     const legs = [];
     const equityUnit = Number(stock.ask) || 0;
-    const optUnit = optAsk > 0 ? optAsk * 100 : 0; // option notional per contract
+    // Use multiplier from contract data; avoid assuming 100 for adjusted contracts
+    const mult = Number(contract?.multiplier);
+    const optUnit = optAsk > 0 && Number.isFinite(mult) && mult > 0 ? optAsk * mult : 0; // option notional per contract
     if (!Number.isFinite(equityUnit) || equityUnit <= 0) return legs;
 
     // Strict 5% minute-volume cap applies only to shares
@@ -952,7 +954,9 @@ async function planHybrid(stock, baseCap, sharesCap, maxShareEquiv) {
             assetClass: "option",
             qty: best.optQty,
             estSpend: toDollars(best.optQty * optUnit),
-            entryAsk: optAsk
+            entryAsk: optAsk,
+            // carry multiplier forward for downstream sizing/accounting
+            multiplier: Number.isFinite(mult) && mult > 0 ? mult : undefined
         });
     }
     if (best.shareQty > 0) {
@@ -996,7 +1000,14 @@ async function revalidateAndCapQtyBeforeBuy(plan, perTradeCap) {
     if (plan.assetClass === "option") {
         let ask = await getLatestOptionAsk(plan.symbol);
         if (!ask) ask = Number(plan.entryAsk || 0);
-        const unit = ask * 100;
+
+        // Ensure we use the contract's multiplier; fetch if not carried in the plan
+        let mult = Number(plan.multiplier);
+        if (!Number.isFinite(mult) || mult <= 0) {
+            mult = await getOptionMultiplier(plan.symbol).catch(() => 100);
+        }
+
+        const unit = ask > 0 ? ask * mult : 0;
         const maxByDollar = unit > 0 ? toWholeQty(perTradeCap / unit) : 0;
         const capped = Math.min(plan.qty, maxByDollar);
         return { qty: toWholeQty(capped), latestAsk: ask, minuteVol: 0 };
@@ -1215,9 +1226,18 @@ async function algo() {
                 }
 
                 const entryPrice = parseFloat(filled.filled_avg_price || p.entryAsk);
-                const notional = p.assetClass === "option"
-                    ? toDollars(cappedQty * entryPrice * 100)
-                    : toDollars(cappedQty * entryPrice);
+
+                // Use contract multiplier from plan or fetch it; avoid assuming 100
+                let notional;
+                if (p.assetClass === "option") {
+                    let multForNotional = Number(p.multiplier);
+                    if (!Number.isFinite(multForNotional) || multForNotional <= 0) {
+                        multForNotional = await getOptionMultiplier(p.symbol).catch(() => 100);
+                    }
+                    notional = toDollars(cappedQty * entryPrice * multForNotional);
+                } else {
+                    notional = toDollars(cappedQty * entryPrice);
+                }
 
                 moneySpent += notional;
 

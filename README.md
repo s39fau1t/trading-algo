@@ -48,6 +48,7 @@ Notes:
   - A single cap controls both per-trade spend and per-symbol exposure: MAX_TRADE_PCT_OF_INITIAL_BP (default 3% of the day’s initial buying power).
   - Exposure is tracked by underlying (equity + options market value) and includes pending allocations within the current batch.
   - Option underlying resolution is based on the options contracts' underlying_symbol field from Alpaca's API; regex parsing of OCC symbols is not used.
+  - Option sizing uses the contract's multiplier from Alpaca's contracts API (no blanket 100 assumption; adjusted contracts are handled). If multiplier is unavailable from the API, 100 is used as a last‑resort fallback.
   - Liquidity cap: minute volume × ask × SPEND_MULT (applies to equity shares only; options ignore volume-based caps).
   - Quantities are whole numbers only (whole shares and whole option contracts).
   - Per-order enforcement: every buy order is capped so its notional is <= MAX_TRADE_PCT_OF_INITIAL_BP × initial buying power.
