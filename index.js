@@ -1126,18 +1126,20 @@ async function algo() {
 
             // Combined exposure capacity for this underlying (existing + pending)
             const currentMV = toDollars((exposureByUnderlying[stock.symbol] || 0) + (pendingExposureByUnderlying[stock.symbol] || 0));
-            const exposureCapacity = Math.max(0, toDollars(perTradeCap - currentMV));
-            if (exposureCapacity < PARAMS.MIN_PRICE) continue;
+
+            // Compute exposure gap to per-trade cap; incremental allowed spend is min(perTradeCap, exposureGap)
+            const exposureGap = Math.max(0, toDollars(perTradeCap - currentMV));
+            const incrementalAllowed = Math.min(perTradeCap, exposureGap);
+            if (incrementalAllowed < PARAMS.MIN_PRICE) continue;
 
             // Liquidity cap for shares only (minute volume × price × SPEND_MULT)
             const sharesLiquidityCap = toDollars(stock.volume * stock.ask * PARAMS.SPEND_MULT);
 
-            // Base cap for both legs (budgets/exposure/per-trade), options are NOT limited by liquidity cap
+            // Base cap for both legs (budgets/exposure); remove redundant min with perTradeCap
             const baseCap = Math.min(
                 remainingAlloc,
                 dailyRemainingNow,
-                exposureCapacity,
-                perTradeCap
+                incrementalAllowed
             );
             const sharesCap = Math.min(baseCap, sharesLiquidityCap);
 
@@ -1204,7 +1206,7 @@ async function algo() {
                 }
                 if (!filled) {
                     // As a fallback, one last check before giving up
-                    const st = await request(`orders/${buyOrder.id}`, API.TRADE);
+                    const st = await request(`orders/${buyOrder.id}`);
                     if (st.status === "filled") filled = st;
                 }
                 if (!filled) {
