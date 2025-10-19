@@ -27,7 +27,7 @@ Interactive commands (type in the same terminal and press Enter):
 - "pump": Resume placing trades/orders. Previously closed positions are not reinstated.
 
 Notes:
-- Dynamic per-ticker top-ups: The bot may add exposure to the same ticker across iterations if capacity remains. There is no “one trade per ticker per day” gate anymore. All trades still respect per-symbol exposure and liquidity caps.
+- Per‑ticker day gate: Once a ticker is bought on a given day, no additional buys for that ticker occur until the next trading day (ET). The restriction applies to the underlying: equity AAPL and any AAPL options are treated as the same ticker.
 - Trading window: The bot only begins placing trades from market open + LOOKBACK_MINUTES (default 9:30 AM ET + 10 min = 9:40 AM ET). If you adjust LOOKBACK_MINUTES, the start time shifts accordingly.
 - Off-hours enforcement: From 3:30 PM ET until the next 9:40 AM ET, the bot enforces a flat state:
   - All positions are closed first, then any remaining open orders are canceled.
@@ -35,7 +35,7 @@ Notes:
   - Trading auto-resumes at 9:40 AM ET unless you manually paused it; "pump" cannot override the off-hours restriction.
 - Hybrid options + equity with custom exits:
   - For each candidate ticker, the planner maximizes dollar spend under the smallest of: per-ticker exposure cap (MAX_TRADE_PCT_OF_INITIAL_BP of initial buying power), daily remaining budget, and liquidity cap (minute volume × price × SPEND_MULT).
-  - It tries a near-ITM call (nearest expiry, strike <= target) and combines contracts with shares to best fit the cap (whole contracts/shares only). If options are not viable, it uses shares only.
+  - It evaluates a near‑ITM call (nearest expiry, strike <= target) and shares, then selects a single best leg (either one option leg or shares) per ticker per day. If options are not viable, it uses shares only.
   - After a buy fills, it immediately places three exit legs:
     - Stop loss: stop at STOP_PRICE_MULT of entry.
     - Trailing stop: trailing_stop with fixed $ trail (PARAMS.TRAILING_STOP_DOLLARS).
@@ -66,7 +66,7 @@ Notes:
   - For every new trade (equity or option), a one-time check runs NON_PROFIT_TIMEOUT_MINUTES after fill; if unrealized P/L <= 0, open exits are canceled and the position is closed at market.
 - Iteration allocation and concurrency:
   - Each iteration plans a batch of buys and submits them in paced “waves” to consume residual budget.
-  - Hybrid per‑ticker planning may produce multiple legs (option + equity) for the same ticker in a single iteration.
+  - One‑per‑ticker per day: the planner submits at most one buy per ticker for the entire day (equity and options considered the same underlying).
   - The bot continues waves within the same iteration until remaining buying power (and the daily cap) are exhausted or no further viable trades exist, while respecting API rate limits.
 
 - 10-minute non-profit exit:

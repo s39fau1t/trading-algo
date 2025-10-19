@@ -1021,6 +1021,9 @@ async function algo() {
         const batchPlans = [];
 
         for (const stock of stocks) {
+            // Enforce per-ticker per-day gate: skip if we already bought this underlying today
+            if (tradedSymbolsToday.has(stock.symbol)) continue;
+
             // Allow re-trading the same symbol across iterations/day if capacity remains
             // Only avoid double planning in the same iteration wave
             if (usedUnderlyings.has(stock.symbol)) continue;
@@ -1049,16 +1052,16 @@ async function algo() {
             const plans = await planOneHybrid(stock, symbolCap, sharesCap);
             if (!plans || plans.length === 0) continue;
 
-            // Total reserved spend for this underlying in this iteration
-            const totalSpend = toDollars(plans.reduce((s, p) => s + p.estSpend, 0));
-            if (totalSpend < PARAMS.MIN_PRICE) continue;
+            // Per requirement: select only ONE leg per ticker for the entire day (pick the largest spend)
+            const chosen = plans.sort((a, b) => b.estSpend - a.estSpend)[0];
+            if (!chosen || chosen.estSpend < PARAMS.MIN_PRICE) continue;
 
-            // Reserve capacity and budget for these legs
-            for (const pl of plans) batchPlans.push(pl);
+            // Reserve capacity and budget for this underlying with only the chosen leg
+            batchPlans.push(chosen);
             usedUnderlyings.add(stock.symbol);
-            pendingExposureByUnderlying[stock.symbol] = (pendingExposureByUnderlying[stock.symbol] || 0) + totalSpend;
-            remainingAlloc = toDollars(Math.max(0, remainingAlloc - totalSpend));
-            dailyRemainingNow = toDollars(Math.max(0, dailyRemainingNow - totalSpend));
+            pendingExposureByUnderlying[stock.symbol] = (pendingExposureByUnderlying[stock.symbol] || 0) + chosen.estSpend;
+            remainingAlloc = toDollars(Math.max(0, remainingAlloc - chosen.estSpend));
+            dailyRemainingNow = toDollars(Math.max(0, dailyRemainingNow - chosen.estSpend));
 
             if (remainingAlloc < PARAMS.MIN_PRICE || dailyRemainingNow < PARAMS.MIN_PRICE) break;
         }
@@ -1073,6 +1076,11 @@ async function algo() {
 
                 if (!cappedQty || cappedQty <= 0) {
                     log(`Skip ${p.symbol}: qty ${p.qty} -> 0 (per-trade or volume cap)`);
+                    continue;
+                }
+                if (tradedSymbolsToday.has(p.underlying || p.symbol)) {
+                    // Safety: if another wave or iteration already bought it, skip
+                    log(`Skip ${p.symbol}: day gate already set for ${p.underlying || p.symbol}`);
                     continue;
                 }
                 if (cappedQty !== p.qty) {
@@ -1126,6 +1134,9 @@ async function algo() {
                     monitorBreakevenStop(p.symbol, entryPrice, exits.stopLossOrderId).catch(() => {});
                 }
                 log(p.assetClass ? "Option BUY" : "Equity BUY", p.symbol, "qty", cappedQty, "avg", toDollars(entryPrice));
+
+                // Mark the underlying as bought for the day (applies to equity and any options on the same ticker)
+                tradedSymbolsToday.add(p.underlying || p.symbol);
 
                 // Schedule non-profit exit
                 scheduleNonProfitExit({ symbol: p.symbol, assetClass: p.assetClass });
