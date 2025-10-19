@@ -53,7 +53,16 @@ const PARAMS = {
     NON_PROFIT_TIMEOUT_MINUTES: 10,
     // Minimum share-equivalent cap when 5% of current minute volume yields 0.
     // Set to 0 to disable the floor entirely.
-    MINUTE_VOL_CAP_MIN_FLOOR_SHARES: 3
+    MINUTE_VOL_CAP_MIN_FLOOR_SHARES: 3,
+    // Static daily universe thresholds (built once per ET day at/after 09:40)
+    UNIVERSE: {
+        PRICE_MIN: 5,            // dollars
+        PRICE_MAX: 1000,         // dollars
+        AVG_1M_VOL_MIN: 20000,   // shares per minute (avg over last N 1m bars)
+        AVG_1M_VOL_LOOKBACK: 20, // N 1m bars to average
+        ATR_DOLLARS_MIN: 0.5,    // dollars
+        ATR_LOOKBACK_DAYS: 15    // daily bars window to compute ATR14
+    }
 };
 
 // Replace single limiter instance
@@ -470,13 +479,6 @@ async function getClosePriceMinutesAgo(symbols, minutesAgo = 10, batchSize = 200
 }
 
 // Helpers for options trading
-// REMOVE: regex-based OCC root parsing
-// function getUnderlyingFromOptionSymbol(sym) {
-//     // Extract leading letters/dots as underlying (e.g., AAPL240118C00190000 -> AAPL)
-//     const m = String(sym).match(/^[A-Z.]+/);
-//     return m ? m[0] : sym;
-// }
-
 async function getNearestITMCallContract(underlying, targetPrice) {
     // Fetch active call contracts for the underlying
     const resp = await request("options/contracts", API.DATA, {
@@ -535,6 +537,149 @@ async function getUnderlyingForOptionSymbols(symbols, batchSize = 200) {
     return out;
 }
 
+// New: static daily universe (rebuilt once per ET day after 09:40)
+let universeToday = new Set();
+let universeBuiltDayKey = null;
+
+// New: compute ATR14 from daily bars
+function computeATR14(dailyBars = []) {
+    // Expect ascending by time; ensure fields for high/low/close
+    const bars = [...dailyBars].sort((a, b) => Date.parse(a.t || a.time || 0) - Date.parse(b.t || b.time || 0));
+    if (bars.length < 15) return 0;
+
+    const tr = [];
+    let prevClose = Number(bars[0].c);
+    for (let i = 1; i < bars.length; i++) {
+        const h = Number(bars[i].h);
+        const l = Number(bars[i].l);
+        const cPrev = Number(prevClose);
+        const range = Math.max(h - l, Math.abs(h - cPrev), Math.abs(l - cPrev));
+        tr.push(range);
+        prevClose = Number(bars[i].c);
+    }
+    // Use last 14 TR values
+    const last14 = tr.slice(-14);
+    if (last14.length < 14) return 0;
+    const sum = last14.reduce((a, b) => a + (Number.isFinite(b) ? b : 0), 0);
+    return sum / 14;
+}
+
+// New: build the daily static universe (price range, avg 1m vol, ATR)
+async function buildDailyUniverse(baseSymbols) {
+    const dayKey = getETDateKey();
+    const startMins = getTradingStartMinutesET();
+    const { hour, minute } = getEasternTimeParts();
+    const nowMins = hour * 60 + minute;
+    if (nowMins < startMins) return; // avoid pre-open builds
+
+    const cfg = PARAMS.UNIVERSE;
+    const set = new Set();
+
+    // Step 1: price filter using latest snapshots
+    const snaps = await getStocksSnapshots(baseSymbols);
+    const priceFiltered = [];
+    for (const [sym, s] of Object.entries(snaps)) {
+        const ask = Number(s?.latestQuote?.ap ?? 0);
+        if (!Number.isFinite(ask) || ask <= 0) continue;
+        if (ask >= cfg.PRICE_MIN && ask <= cfg.PRICE_MAX) {
+            priceFiltered.push(sym);
+        }
+    }
+    if (priceFiltered.length === 0) {
+        universeToday = set;
+        universeBuiltDayKey = dayKey;
+        log("Universe build: no symbols passed price filter.");
+        return;
+    }
+
+    // Step 2: avg 1m volume over last N 1m bars
+    const avgVolBySymbol = {};
+    for (let i = 0; i < priceFiltered.length; i += 200) {
+        const batch = priceFiltered.slice(i, i + 200);
+        const resp = await request("stocks/bars", API.DATA, {
+            params: {
+                symbols: batch,
+                timeframe: "1Min",
+                limit: cfg.AVG_1M_VOL_LOOKBACK,
+                feed: "iex"
+            }
+        });
+        const map = normalizeBarsMap(resp);
+        for (const sym of batch) {
+            const bars = map[sym] || [];
+            if (!bars.length) continue;
+            const avg = bars.reduce((a, b) => a + Number(b.v || 0), 0) / bars.length;
+            avgVolBySymbol[sym] = avg;
+        }
+    }
+
+    const volFiltered = priceFiltered.filter(sym => (avgVolBySymbol[sym] || 0) >= cfg.AVG_1M_VOL_MIN);
+    if (volFiltered.length === 0) {
+        universeToday = set;
+        universeBuiltDayKey = dayKey;
+        log("Universe build: no symbols passed avg 1m volume filter.");
+        return;
+    }
+
+    // Step 3: ATR14 from daily bars (last ~15 days)
+    const atrBySymbol = {};
+    const daysBack = Math.max(20, cfg.ATR_LOOKBACK_DAYS + 6);
+    const start = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString();
+    for (let i = 0; i < volFiltered.length; i += 200) {
+        const batch = volFiltered.slice(i, i + 200);
+        const resp = await request("stocks/bars", API.DATA, {
+            params: {
+                symbols: batch,
+                timeframe: "1Day",
+                start,
+                feed: "iex"
+            }
+        });
+        const map = normalizeBarsMap(resp);
+        for (const sym of batch) {
+            const bars = map[sym] || [];
+            const atr = computeATR14(bars);
+            if (Number.isFinite(atr)) atrBySymbol[sym] = atr;
+        }
+    }
+
+    for (const sym of volFiltered) {
+        if ((atrBySymbol[sym] || 0) >= cfg.ATR_DOLLARS_MIN) {
+            set.add(sym);
+        }
+    }
+
+    universeToday = set;
+    universeBuiltDayKey = dayKey;
+    log(`Universe built: ${set.size} symbols (price in [${cfg.PRICE_MIN}, ${cfg.PRICE_MAX}], avg1mVol >= ${cfg.AVG_1M_VOL_MIN} over ${cfg.AVG_1M_VOL_LOOKBACK} bars, ATR14 >= ${cfg.ATR_DOLLARS_MIN}).`);
+}
+
+// New: ensure universe is built once per ET day after open+lookback
+async function ensureUniverseBuilt(baseSymbols) {
+    const dayKey = getETDateKey();
+    if (universeBuiltDayKey === dayKey && universeToday.size > 0) return;
+
+    const { hour, minute } = getEasternTimeParts();
+    const nowMins = hour * 60 + minute;
+    const startMins = getTradingStartMinutesET();
+    if (nowMins >= startMins) {
+        await buildDailyUniverse(baseSymbols);
+    }
+}
+
+// Fix: missing helper to get option multiplier
+async function getOptionMultiplier(optionSymbol) {
+    try {
+        const resp = await request("options/contracts", API.DATA, { params: { symbols: optionSymbol } });
+        const arr = Array.isArray(resp) ? resp : (resp.contracts || []);
+        const found = arr.find(c => c.symbol === optionSymbol);
+        const mult = Number(found?.multiplier);
+        return Number.isFinite(mult) && mult > 0 ? mult : 100;
+    } catch {
+        return 100;
+    }
+}
+
 const assetsResp = await request("assets", API.TRADE, {
     params: {
         status: "active",
@@ -557,7 +702,6 @@ let currentDayKey = null;
 // Add: track traded symbols per day
 let tradedSymbolsToday = new Set();
 
-// New: ensure day state (reset on ET date change)
 async function ensureDayState() {
     const dayKey = getETDateKey();
     if (currentDayKey !== dayKey || !initialBuyingPower) {
@@ -566,6 +710,9 @@ async function ensureDayState() {
         currentDayKey = dayKey;
         moneySpent = 0;
         tradedSymbolsToday.clear(); // Reset traded symbols on new day
+        // New: reset daily universe so it rebuilds at/after 09:40 ET
+        universeToday.clear();
+        universeBuiltDayKey = null;
     }
 }
 
@@ -1052,11 +1199,15 @@ async function algo() {
 
     await ensureDayState();
 
+    // New: build static universe once per day
+    await ensureUniverseBuilt(symbols);
+
     const snapshots = await getStocksSnapshots(symbols);
 
-    // Pre-filter viable symbols and gather for historical lookup
+    // Pre-filter viable symbols using the static universe and gather for historical lookup
     const viableSymbols = [];
     for (const [symbol, snapshot] of Object.entries(snapshots)) {
+        if (!universeToday.has(symbol)) continue; // New: only scan inside universe
         if (!snapshot?.minuteBar || !snapshot?.latestQuote) continue;
         const ask = snapshot.latestQuote.ap;
         if (ask < PARAMS.MIN_PRICE) continue;

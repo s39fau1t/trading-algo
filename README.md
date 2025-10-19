@@ -57,6 +57,13 @@ Notes:
   - When the 5% calculation resolves to 0 shares (e.g., thin symbols early in the minute), a small configurable floor MINUTE_VOL_CAP_MIN_FLOOR_SHARES is allowed to avoid 0‑share blocks. Set it to 0 to disable this behavior.
   - Option contracts are NOT constrained by current-minute volume; they only adhere to MAX_TRADE_PCT_OF_INITIAL_BP.
   - Per-order enforcement: right before each equity buy is submitted, the order quantity is revalidated and capped so that the single order adheres to the minute-volume rule or the configured floor, whichever applies.
+- Static daily universe (built once at/after 9:40 AM ET):
+  - At 9:40 AM ET, the bot builds a fixed symbol universe for the day and only scans within it.
+  - Filters:
+    - Price in [UNIVERSE.PRICE_MIN, UNIVERSE.PRICE_MAX] using latest snapshot ask.
+    - Average 1‑minute volume over the last UNIVERSE.AVG_1M_VOL_LOOKBACK 1‑min bars >= UNIVERSE.AVG_1M_VOL_MIN.
+    - ATR14 (computed from the last ~15 daily bars) >= UNIVERSE.ATR_DOLLARS_MIN.
+  - The universe is rebuilt on the next ET trading day and remains static intra‑day.
 - Data feed and lookback:
   - Uses IEX feed for snapshots and 1-minute bars; percent change is computed versus approximately LOOKBACK_MINUTES ago.
 - Timing and scheduling:
@@ -89,6 +96,13 @@ Configuration quick reference (index.js PARAMS):
 - LOOKBACK_MINUTES: Minutes to look back for momentum. Default: 10 (sets start time to 9:30 + LOOKBACK_MINUTES).
 - NON_PROFIT_TIMEOUT_MINUTES: Minutes after fill to close if P/L <= 0. Default: 10.
 - MINUTE_VOL_CAP_MIN_FLOOR_SHARES: Minimum share-equivalent cap if the strict 5% rule yields 0. Default: 3 (set to 0 to disable).
+- UNIVERSE:
+  - PRICE_MIN: Min price for universe filter. Default: 5.
+  - PRICE_MAX: Max price for universe filter. Default: 1000.
+  - AVG_1M_VOL_MIN: Min average 1‑minute volume (shares). Default: 20000.
+  - AVG_1M_VOL_LOOKBACK: Number of 1‑minute bars to average. Default: 20.
+  - ATR_DOLLARS_MIN: Min ATR14 in dollars (from daily bars). Default: 0.5.
+  - ATR_LOOKBACK_DAYS: Daily bars window to compute ATR14 (needs >=15 to compute). Default: 15.
 
 Operational tips:
 - Use "dump" any time to flatten immediately and pause trading; the bot stays running.
