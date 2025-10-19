@@ -459,11 +459,12 @@ async function getClosePriceMinutesAgo(symbols, minutesAgo = 10, batchSize = 200
 }
 
 // Helpers for options trading
-function getUnderlyingFromOptionSymbol(sym) {
-    // Extract leading letters/dots as underlying (e.g., AAPL240118C00190000 -> AAPL)
-    const m = String(sym).match(/^[A-Z.]+/);
-    return m ? m[0] : sym;
-}
+// REMOVE: regex-based OCC root parsing
+// function getUnderlyingFromOptionSymbol(sym) {
+//     // Extract leading letters/dots as underlying (e.g., AAPL240118C00190000 -> AAPL)
+//     const m = String(sym).match(/^[A-Z.]+/);
+//     return m ? m[0] : sym;
+// }
 
 async function getNearestITMCallContract(underlying, targetPrice) {
     // Fetch active call contracts for the underlying
@@ -501,6 +502,26 @@ async function getNearestITMCallContract(underlying, targetPrice) {
 
     candidates.sort((a, b) => Number(b.strike_price) - Number(a.strike_price));
     return candidates[0]; // has .symbol, .strike_price, .expiration_date
+}
+
+// New: batch-resolve underlying_symbol for option contract symbols
+async function getUnderlyingForOptionSymbols(symbols, batchSize = 200) {
+    const out = {};
+    if (!symbols?.length) return out;
+
+    for (let i = 0; i < symbols.length; i += batchSize) {
+        const batch = symbols.slice(i, i + batchSize);
+        const resp = await request("options/contracts", API.DATA, {
+            params: { symbols: batch }
+        });
+        const arr = Array.isArray(resp) ? resp : (resp.contracts || []);
+        for (const c of arr) {
+            if (c?.symbol && c?.underlying_symbol) {
+                out[c.symbol] = c.underlying_symbol;
+            }
+        }
+    }
+    return out;
 }
 
 const assetsResp = await request("assets", API.TRADE, {
@@ -1046,8 +1067,21 @@ async function algo() {
     // Snapshot combined exposure (equity + options) by underlying symbol
     const positions = await request("positions", API.TRADE);
     const exposureByUnderlying = {};
+
+    // Resolve underlying symbols for any option positions via contracts data
+    const optionSymbols = [...new Set(
+        (Array.isArray(positions) ? positions : [])
+            .filter(p => String(p.asset_class).toLowerCase().includes("option"))
+            .map(p => p.symbol)
+    )];
+
+    const optUnderMap = optionSymbols.length
+        ? await getUnderlyingForOptionSymbols(optionSymbols)
+        : {};
+
     for (const p of positions) {
-        const underlying = p.asset_class === "option" ? getUnderlyingFromOptionSymbol(p.symbol) : p.symbol;
+        const isOption = String(p.asset_class).toLowerCase().includes("option");
+        const underlying = isOption ? (optUnderMap[p.symbol] || p.symbol) : p.symbol;
         exposureByUnderlying[underlying] = (exposureByUnderlying[underlying] || 0) + parseFloat(p.market_value);
     }
 
