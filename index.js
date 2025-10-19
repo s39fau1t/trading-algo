@@ -1,11 +1,10 @@
 //alpaca paper trading
 //key: PKEMJZFGOJ6JDHDOLOJC6PYE2D
 //secret: GL3UD9kbckymMGBWF7cHvniPo8RFgENrE33BpZJWtVHz
-//testing commit
-//testing commit 3
 
 import Ratelimiter from "./ratelimiter.js";
 import readline from "node:readline";
+import WebSocket from "ws"; // WebSocket for trade_updates
 
 const API = Object.freeze({
     DOMAIN: "alpaca.markets/v2",
@@ -60,6 +59,99 @@ const rateLimiterPerSecond = new Ratelimiter(RL_PER_SEC_MAX, RL_PER_SEC_SPAN);
 
 // Add: readline interface handle
 let rl = null;
+
+// Add: OCO groups registry keyed by client_order_id prefix
+const ocoGroups = new Map(); // prefix -> { symbol, ids: { stopLossOrderId, trailingStopOrderId, takeProfitOrderId }, done: boolean }
+// Helper to register a group once exits are placed
+function registerOCOGroup(prefix, symbol, ids) {
+    ocoGroups.set(prefix, { symbol, ids, done: false });
+}
+
+// Add: Alpaca trade_updates WebSocket with auto-reconnect
+function connectTradeUpdates() {
+    const url = `wss://${API.TRADE}.${API.DOMAIN}/stream`;
+    let ws;
+    let reconnectDelay = 1000;
+
+    const subscribe = () => {
+        try {
+            ws = new WebSocket(url);
+        } catch (e) {
+            log("WS connect error:", e?.message || e);
+            return setTimeout(subscribe, Math.min(30000, reconnectDelay *= 2));
+        }
+
+        ws.on("open", () => {
+            reconnectDelay = 1000;
+            // Authenticate
+            ws.send(JSON.stringify({
+                action: "authenticate",
+                data: { key_id: API.KEY, secret_key: API.SECRET }
+            }));
+        });
+
+        ws.on("message", async (raw) => {
+            let msg;
+            try { msg = JSON.parse(String(raw)); } catch { return; }
+            const stream = msg.stream || msg.T || msg.type || "";
+            const data = msg.data || msg;
+            // Handle auth/listen acks across legacy/new formats
+            if (stream === "authorization" && (data.status === "authorized" || data.message === "authenticated")) {
+                ws.send(JSON.stringify({ action: "listen", data: { streams: ["trade_updates"] } }));
+                log("WS authorized; subscribed to trade_updates.");
+                return;
+            }
+            if (stream === "listening") {
+                // Already listening
+                return;
+            }
+            if (stream === "trade_updates" || data?.event) {
+                try {
+                    const ev = data.event; // e.g., "fill", "partial_fill", "canceled", etc.
+                    const order = data.order || {};
+                    const cid = order.client_order_id || order.client_order_id?.toString() || "";
+                    if (!cid || !cid.startsWith("oco-")) return;
+
+                    // Expect suffix -sl | -ts | -tp
+                    const prefix = cid.replace(/-(sl|ts|tp)$/, "");
+                    const group = ocoGroups.get(prefix);
+                    if (!group || group.done) return;
+
+                    if (ev === "fill") {
+                        const filledId = order.id;
+                        const siblings = [
+                            group.ids.stopLossOrderId,
+                            group.ids.trailingStopOrderId,
+                            group.ids.takeProfitOrderId
+                        ].filter(id => id && id !== filledId);
+
+                        if (siblings.length) {
+                            log(`Trade update fill for ${order.symbol} (${cid}); canceling ${siblings.length} sibling(s).`);
+                            await Promise.all(siblings.map(id =>
+                                request(`orders/${id}`, API.TRADE, { method: "DELETE" }).catch(() => {})
+                            ));
+                        }
+                        group.done = true;
+                    }
+                } catch (e) {
+                    // swallow listener errors
+                }
+            }
+        });
+
+        ws.on("close", () => {
+            log("WS closed. Reconnecting...");
+            setTimeout(subscribe, Math.min(30000, reconnectDelay *= 2));
+        });
+
+        ws.on("error", (err) => {
+            log("WS error:", err?.message || err);
+            try { ws.close(); } catch {}
+        });
+    };
+
+    subscribe();
+}
 
 // --- Logging helpers (ET timestamp) ---
 function etNow() {
@@ -530,44 +622,6 @@ async function flattenAndCancel() {
     log("Flatten-and-cancel complete.");
 }
 
-// Add: non-blocking OCO monitor helper (detached)
-async function monitorOCO(stopLossOrderId, trailingStopOrderId, takeProfitOrderId) {
-    const cancelIfOpen = async (id) => {
-        try { await request(`orders/${id}`, API.TRADE, { method: "DELETE" }); } catch {}
-    };
-    try {
-        let resolved = false;
-        while (!resolved) {
-            const [slStatus, tsStatus, tpStatus] = await Promise.all([
-                request(`orders/${stopLossOrderId}`, API.TRADE),
-                request(`orders/${trailingStopOrderId}`, API.TRADE),
-                request(`orders/${takeProfitOrderId}`, API.TRADE)
-            ]);
-
-            if (slStatus.status === "filled") {
-                await Promise.all([cancelIfOpen(trailingStopOrderId), cancelIfOpen(takeProfitOrderId)]);
-                resolved = true;
-            } else if (tsStatus.status === "filled") {
-                await Promise.all([cancelIfOpen(stopLossOrderId), cancelIfOpen(takeProfitOrderId)]);
-                resolved = true;
-            } else if (tpStatus.status === "filled") {
-                await Promise.all([cancelIfOpen(stopLossOrderId), cancelIfOpen(trailingStopOrderId)]);
-                resolved = true;
-            } else if (
-                ["canceled", "expired"].includes(slStatus.status) &&
-                ["canceled", "expired"].includes(tsStatus.status) &&
-                ["canceled", "expired"].includes(tpStatus.status)
-            ) {
-                resolved = true;
-            } else {
-                await new Promise(res => setTimeout(res, 5000));
-            }
-        }
-    } catch {
-        // swallow background errors
-    }
-}
-
 // Add: move stop to breakeven after $0.50 advance (equity only)
 async function monitorBreakevenStop(symbol, entryPrice, stopLossOrderId) {
     try {
@@ -637,9 +691,8 @@ function buildOrderBody({ symbol, qty, side, type, tif = "gtc", assetClass, extr
     return body;
 }
 
-// Add: ensure custom bracket legs (stop loss + trailing stop + take profit) are all placed.
-// If trailing stop cannot be placed, cancel any created legs and throw.
-async function placeCustomBracketOrders({ symbol, qty, assetClass, entryPrice }) {
+// Replace: ensure custom bracket legs include shared client_order_id prefix
+async function placeCustomBracketOrders({ symbol, qty, assetClass, entryPrice, clientIdPrefix }) {
     const takeProfitPrice = toDollars(entryPrice * (1 + PARAMS.TAKE_PROFIT_PERCENT / 100));
     const stopLossPrice = Math.min(toDollars(entryPrice * PARAMS.STOP_PRICE_MULT), entryPrice - 0.01);
 
@@ -648,23 +701,22 @@ async function placeCustomBracketOrders({ symbol, qty, assetClass, entryPrice })
         stopLossOrder = await placeOrderWithRetry(
             buildOrderBody({
                 symbol, qty, side: "sell", type: "stop", assetClass,
-                extra: { stop_price: stopLossPrice }
+                extra: { stop_price: stopLossPrice, client_order_id: `${clientIdPrefix}-sl` }
             })
         );
 
-        // Emphasize reliability for trailing stop leg (now uses a fixed $ trail)
         trailingStopOrder = await placeOrderWithRetry(
             buildOrderBody({
                 symbol, qty, side: "sell", type: "trailing_stop", assetClass,
-                extra: { trail_price: toDollars(PARAMS.TRAILING_STOP_DOLLARS || 0.5) }
+                extra: { trail_price: toDollars(PARAMS.TRAILING_STOP_DOLLARS || 0.5), client_order_id: `${clientIdPrefix}-ts` }
             }),
-            4 // extra retry for the trailing leg
+            4
         );
 
         takeProfitOrder = await placeOrderWithRetry(
             buildOrderBody({
                 symbol, qty, side: "sell", type: "limit", assetClass,
-                extra: { limit_price: takeProfitPrice }
+                extra: { limit_price: takeProfitPrice, client_order_id: `${clientIdPrefix}-tp` }
             })
         );
 
@@ -672,7 +724,6 @@ async function placeCustomBracketOrders({ symbol, qty, assetClass, entryPrice })
             throw new Error("Trailing stop placement failed");
         }
     } catch (e) {
-        // Cancel any legs that might have been created to avoid dangling exits
         const ids = [stopLossOrder?.id, trailingStopOrder?.id, takeProfitOrder?.id].filter(Boolean);
         await Promise.all(ids.map(id =>
             request(`orders/${id}`, API.TRADE, { method: "DELETE" }).catch(() => {})
@@ -1123,13 +1174,20 @@ async function algo() {
 
                 moneySpent += notional;
 
+                // New: create shared client_order_id prefix for the sibling exits
+                const cidPrefix = `oco-${(p.underlying || p.symbol)}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,6)}`;
+
                 const exits = await placeCustomBracketOrders({
                     symbol: p.symbol,
                     qty: cappedQty,
                     assetClass: p.assetClass,
-                    entryPrice
+                    entryPrice,
+                    clientIdPrefix: cidPrefix
                 });
-                monitorOCO(exits.stopLossOrderId, exits.trailingStopOrderId, exits.takeProfitOrderId).catch(() => {});
+
+                // Register OCO group for WS-driven sibling cancellation
+                registerOCOGroup(cidPrefix, p.symbol, exits);
+
                 if (!p.assetClass) {
                     monitorBreakevenStop(p.symbol, entryPrice, exits.stopLossOrderId).catch(() => {});
                 }
@@ -1157,6 +1215,9 @@ async function algo() {
 // Initialize day state once at startup
 await ensureDayState();
 log("Initialized. Tradable NYSE symbols:", symbols.length);
+
+// New: connect trade_updates WebSocket for immediate sibling cancellations
+connectTradeUpdates();
 
 // Replace raw stdin handler with readline prompt
 rl = readline.createInterface({

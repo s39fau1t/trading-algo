@@ -7,10 +7,11 @@ Prerequisites:
 Setup:
 1. Clone the repo and open the project directory.
 2. (Optional) Replace the hardcoded API.KEY and API.SECRET in index.js with your own paper keys. (The current API.KEY and API.SECRET are that of Milo's paper trading account)
-3. Install dependencies (none required, but this ensures tooling is ready):
+3. Install dependencies:
    ```
    npm install
    ```
+   This installs the ws library used for Alpaca trade_updates WebSocket.
 
 Run:
 - Start the bot:
@@ -40,7 +41,7 @@ Notes:
     - Stop loss: stop at STOP_PRICE_MULT of entry.
     - Trailing stop: trailing_stop with fixed $ trail (PARAMS.TRAILING_STOP_DOLLARS).
     - Take profit: limit at TAKE_PROFIT_PERCENT above entry.
-  - An OCO monitor cancels siblings when one fills; trailing stop placement is retried for reliability.
+  - OCO race reduction: all three exits share a client_order_id prefix; a trade_updates WebSocket listener cancels the two sibling exits immediately when one fills (no polling).
 - Breakeven stop adjustment (equities):
   - After an equity buy fills, if the price rises by BREAKEVEN_TRIGGER_DELTA above entry, the stop loss is moved to breakeven.
 - Exposure and sizing:
@@ -59,26 +60,13 @@ Notes:
 - Timing and scheduling:
   - Uses US/Eastern time for all scheduling. A cleanup scheduler targets 3:30 PM ET; enforceOffHours also runs each iteration to keep the account flat during off-hours.
   - Default iteration interval is 30 seconds (PARAMS.INTERVAL). A simple countdown is shown; interactive mode avoids overwriting your input.
-- Rate limiting: A token bucket (200 req/min) throttles all API calls.
-- Ensure your account has sufficient buying power and that paper trading is enabled.
-- Stop the program with Ctrl+C.
-- 10-minute non-profit exit:
-  - For every new trade (equity or option), a one-time check runs NON_PROFIT_TIMEOUT_MINUTES after fill; if unrealized P/L <= 0, open exits are canceled and the position is closed at market.
-- Iteration allocation and concurrency:
-  - Each iteration plans a batch of buys and submits them in paced “waves” to consume residual budget.
-  - One‑per‑ticker per day: the planner submits at most one buy per ticker for the entire day (equity and options considered the same underlying).
-  - The bot continues waves within the same iteration until remaining buying power (and the daily cap) are exhausted or no further viable trades exist, while respecting API rate limits.
-
-- 10-minute non-profit exit:
-  - For every new trade (equity or option), a one-time check runs NON_PROFIT_TIMEOUT_MINUTES after fill; if unrealized P/L <= 0, open exits are canceled and the position is closed at market.
-
 - Rate limiting:
   - Dual token buckets throttle all API calls to both 10 requests/second and 200 requests/minute.
   - Trade submission per wave is sequentially paced to avoid bursty traffic; iterations still run as fast as the limits allow.
-
-- Logging and terminal UX:
-  - Logs include ET timestamps.
-  - A countdown appears between iterations; in interactive mode, the bot avoids overwriting your input prompt.
+- WebSocket trade updates:
+  - The bot authenticates to Alpaca’s trading stream and listens for trade_updates.
+  - Exit orders are tagged with a shared client_order_id prefix; on a fill event for any exit, siblings are canceled immediately.
+  - Automatic reconnect is implemented.
 
 - Safety and environment:
   - This is intended for Alpaca Paper Trading. Ensure your paper account (and options permissions) are enabled and has sufficient buying power.
