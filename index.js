@@ -58,8 +58,6 @@ const PARAMS = {
     UNIVERSE: {
         PRICE_MIN: 5,            // dollars
         PRICE_MAX: 1000,         // dollars
-        AVG_1M_VOL_MIN: 20000,   // shares per minute (avg over last N 1m bars)
-        AVG_1M_VOL_LOOKBACK: 20, // N 1m bars to average
         ATR_DOLLARS_MIN: 0.5,    // dollars
         ATR_LOOKBACK_DAYS: 15    // daily bars window to compute ATR14
     }
@@ -564,7 +562,7 @@ function computeATR14(dailyBars = []) {
     return sum / 14;
 }
 
-// New: build the daily static universe (price range, avg 1m vol, ATR)
+// New: build the daily static universe (price range, ATR)
 async function buildDailyUniverse(baseSymbols) {
     const dayKey = getETDateKey();
     const startMins = getTradingStartMinutesET();
@@ -592,41 +590,12 @@ async function buildDailyUniverse(baseSymbols) {
         return;
     }
 
-    // Step 2: avg 1m volume over last N 1m bars
-    const avgVolBySymbol = {};
-    for (let i = 0; i < priceFiltered.length; i += 200) {
-        const batch = priceFiltered.slice(i, i + 200);
-        const resp = await request("stocks/bars", API.DATA, {
-            params: {
-                symbols: batch,
-                timeframe: "1Min",
-                limit: cfg.AVG_1M_VOL_LOOKBACK,
-                feed: "iex"
-            }
-        });
-        const map = normalizeBarsMap(resp);
-        for (const sym of batch) {
-            const bars = map[sym] || [];
-            if (!bars.length) continue;
-            const avg = bars.reduce((a, b) => a + Number(b.v || 0), 0) / bars.length;
-            avgVolBySymbol[sym] = avg;
-        }
-    }
-
-    const volFiltered = priceFiltered.filter(sym => (avgVolBySymbol[sym] || 0) >= cfg.AVG_1M_VOL_MIN);
-    if (volFiltered.length === 0) {
-        universeToday = set;
-        universeBuiltDayKey = dayKey;
-        log("Universe build: no symbols passed avg 1m volume filter.");
-        return;
-    }
-
-    // Step 3: ATR14 from daily bars (last ~15 days)
+    // Step 2 (now): ATR14 from daily bars (last ~15 days)
     const atrBySymbol = {};
     const daysBack = Math.max(20, cfg.ATR_LOOKBACK_DAYS + 6);
     const start = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString();
-    for (let i = 0; i < volFiltered.length; i += 200) {
-        const batch = volFiltered.slice(i, i + 200);
+    for (let i = 0; i < priceFiltered.length; i += 200) {
+        const batch = priceFiltered.slice(i, i + 200);
         const resp = await request("stocks/bars", API.DATA, {
             params: {
                 symbols: batch,
@@ -643,7 +612,7 @@ async function buildDailyUniverse(baseSymbols) {
         }
     }
 
-    for (const sym of volFiltered) {
+    for (const sym of priceFiltered) {
         if ((atrBySymbol[sym] || 0) >= cfg.ATR_DOLLARS_MIN) {
             set.add(sym);
         }
@@ -651,7 +620,7 @@ async function buildDailyUniverse(baseSymbols) {
 
     universeToday = set;
     universeBuiltDayKey = dayKey;
-    log(`Universe built: ${set.size} symbols (price in [${cfg.PRICE_MIN}, ${cfg.PRICE_MAX}], avg1mVol >= ${cfg.AVG_1M_VOL_MIN} over ${cfg.AVG_1M_VOL_LOOKBACK} bars, ATR14 >= ${cfg.ATR_DOLLARS_MIN}).`);
+    log(`Universe built: ${set.size} symbols (price in [${cfg.PRICE_MIN}, ${cfg.PRICE_MAX}], ATR14 >= ${cfg.ATR_DOLLARS_MIN}).`);
 }
 
 // New: ensure universe is built once per ET day after open+lookback
