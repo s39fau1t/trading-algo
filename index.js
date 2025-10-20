@@ -839,51 +839,33 @@ function buildOrderBody({ symbol, qty, side, type, tif = "gtc", assetClass, extr
     return body;
 }
 
-// Replace: ensure custom bracket legs include shared client_order_id prefix
-async function placeCustomBracketOrders({ symbol, qty, assetClass, entryPrice, clientIdPrefix }) {
-    const takeProfitPrice = toDollars(entryPrice * (1 + PARAMS.TAKE_PROFIT_PERCENT / 100));
-    const stopLossPrice = Math.min(toDollars(entryPrice * PARAMS.STOP_PRICE_MULT), entryPrice - 0.01);
-
-    let stopLossOrder, trailingStopOrder, takeProfitOrder;
-    try {
-        stopLossOrder = await placeOrderWithRetry(
+// Add: place a single options exit (reduce_only). Prefer trailing stop; fallback to fixed stop.
+async function placeOptionExitOrder({ symbol, qty, entryPrice }) {
+    const trail = toDollars(PARAMS.TRAILING_STOP_DOLLARS || 0);
+    if (trail > 0) {
+        await placeOrderWithRetry(
             buildOrderBody({
-                symbol, qty, side: "sell", type: "stop", assetClass,
-                extra: { stop_price: stopLossPrice, client_order_id: `${clientIdPrefix}-sl` }
+                symbol,
+                qty,
+                side: "sell",
+                type: "trailing_stop",
+                assetClass: "option",
+                extra: { trail_price: trail, reduce_only: true, time_in_force: "day" }
             })
         );
-
-        trailingStopOrder = await placeOrderWithRetry(
-            buildOrderBody({
-                symbol, qty, side: "sell", type: "trailing_stop", assetClass,
-                extra: { trail_price: toDollars(PARAMS.TRAILING_STOP_DOLLARS || 0.5), client_order_id: `${clientIdPrefix}-ts` }
-            }),
-            4
-        );
-
-        takeProfitOrder = await placeOrderWithRetry(
-            buildOrderBody({
-                symbol, qty, side: "sell", type: "limit", assetClass,
-                extra: { limit_price: takeProfitPrice, client_order_id: `${clientIdPrefix}-tp` }
-            })
-        );
-
-        if (!trailingStopOrder?.id) {
-            throw new Error("Trailing stop placement failed");
-        }
-    } catch (e) {
-        const ids = [stopLossOrder?.id, trailingStopOrder?.id, takeProfitOrder?.id].filter(Boolean);
-        await Promise.all(ids.map(id =>
-            request(`orders/${id}`, API.TRADE, { method: "DELETE" }).catch(() => {})
-        ));
-        throw e;
+        return;
     }
-
-    return {
-        stopLossOrderId: stopLossOrder.id,
-        trailingStopOrderId: trailingStopOrder.id,
-        takeProfitOrderId: takeProfitOrder.id
-    };
+    const stopLossPrice = Math.max(0.01, toDollars(entryPrice * PARAMS.STOP_PRICE_MULT));
+    await placeOrderWithRetry(
+        buildOrderBody({
+            symbol,
+            qty,
+            side: "sell",
+            type: "stop",
+            assetClass: "option",
+            extra: { stop_price: stopLossPrice, reduce_only: true, time_in_force: "day" }
+        })
+    );
 }
 
 // Add: enforce off-hours state (flat positions, no open orders, pause trading)
@@ -1301,14 +1283,13 @@ async function algo() {
         for (const p of batchPlans) {
             try {
                 const cap = toDollars(initialBuyingPower * PARAMS.MAX_TRADE_PCT_OF_INITIAL_BP);
-                const { qty: cappedQty } = await revalidateAndCapQtyBeforeBuy(p, cap);
+                const { qty: cappedQty, latestAsk } = await revalidateAndCapQtyBeforeBuy(p, cap);
 
                 if (!cappedQty || cappedQty <= 0) {
                     log(`Skip ${p.symbol}: qty ${p.qty} -> 0 (per-trade or volume cap)`);
                     continue;
                 }
                 if (tradedSymbolsToday.has(p.underlying || p.symbol)) {
-                    // Safety: if another wave or iteration already bought it, skip
                     log(`Skip ${p.symbol}: day gate already set for ${p.underlying || p.symbol}`);
                     continue;
                 }
@@ -1316,71 +1297,120 @@ async function algo() {
                     log(`Cap ${p.symbol}: qty ${p.qty} -> ${cappedQty} (per-trade/volume)`);
                 }
 
-                const body = {
-                    symbol: p.symbol,
-                    qty: cappedQty,
-                    side: "buy",
-                    type: "market",
-                    time_in_force: "day",
-                    ...(p.assetClass === "option" ? { asset_class: "option" } : {})
-                };
-                const buyOrder = await request("orders", API.TRADE, { method: "POST", body: JSON.stringify(body) });
+                if (!p.assetClass) {
+                    // EQUITY: place a single broker-side bracket to avoid over-reserving qty
+                    const refPrice = Number(latestAsk || p.entryAsk || 0);
+                    const takeProfitPrice = toDollars(refPrice * (1 + PARAMS.TAKE_PROFIT_PERCENT / 100));
+                    const stopLossPrice = Math.max(0.01, toDollars(refPrice * PARAMS.STOP_PRICE_MULT));
 
-                // Wait for fill with a short exponential backoff (up to ~30s total)
-                let filled = null;
-                let delay = 1000;
-                for (let i = 0; i < 8; i++) {
-                    const st = await request(`orders/${buyOrder.id}`, API.TRADE);
-                    if (st.status === "filled") { filled = st; break; }
-                    await new Promise(res => setTimeout(res, delay));
-                    delay = Math.min(8000, Math.floor(delay * 1.6));
-                }
-                if (!filled) {
-                    // As a fallback, one last check before giving up
-                    const st = await request(`orders/${buyOrder.id}`);
-                    if (st.status === "filled") filled = st;
-                }
-                if (!filled) {
-                    log(`Buy not filled in time: ${p.symbol}`);
-                    continue;
-                }
+                    const buyBracket = await request("orders", API.TRADE, {
+                        method: "POST",
+                        body: JSON.stringify({
+                            symbol: p.symbol,
+                            qty: cappedQty,
+                            side: "buy",
+                            type: "market",
+                            time_in_force: "day",
+                            order_class: "bracket",
+                            take_profit: { limit_price: takeProfitPrice },
+                            stop_loss: { stop_price: stopLossPrice }
+                        })
+                    });
 
-                const entryPrice = parseFloat(filled.filled_avg_price || p.entryAsk);
+                    // Wait for parent to fill
+                    let filled = null;
+                    let delay = 1000;
+                    for (let i = 0; i < 8; i++) {
+                        const st = await request(`orders/${buyBracket.id}`, API.TRADE);
+                        if (st.status === "filled") { filled = st; break; }
+                        await new Promise(res => setTimeout(res, delay));
+                        delay = Math.min(8000, Math.floor(delay * 1.6));
+                    }
+                    if (!filled) {
+                        const st = await request(`orders/${buyBracket.id}`, API.TRADE);
+                        if (st.status === "filled") filled = st;
+                    }
+                    if (!filled) {
+                        log(`Buy not filled in time: ${p.symbol}`);
+                        continue;
+                    }
 
-                // Use contract multiplier from plan or fetch it; avoid assuming 100
-                let notional;
-                if (p.assetClass === "option") {
+                    const entryPrice = parseFloat(filled.filled_avg_price || refPrice || 0);
+                    const notional = toDollars(cappedQty * entryPrice);
+                    moneySpent += notional;
+
+                    // Find the child stop-loss order id (for breakeven adjustment)
+                    let stopLossOrderId = null;
+                    try {
+                        // Prefer legs if present on parent fetch
+                        const parent = await request(`orders/${buyBracket.id}`, API.TRADE);
+                        const legs = Array.isArray(parent?.legs) ? parent.legs : [];
+                        const slLeg = legs.find(l => l.type === "stop" && l.side === "sell");
+                        stopLossOrderId = slLeg?.id || null;
+
+                        // Fallback: scan open orders for this symbol with parent_order_id
+                        if (!stopLossOrderId) {
+                            const openOrders = await request("orders", API.TRADE, { params: { status: "open" } });
+                            const sl = (Array.isArray(openOrders) ? openOrders : []).find(
+                                o => o.symbol === p.symbol && o.side === "sell" && o.type === "stop" && o.parent_order_id === buyBracket.id
+                            );
+                            stopLossOrderId = sl?.id || null;
+                        }
+                    } catch { /* noop */ }
+
+                    if (stopLossOrderId) {
+                        // Only adjust breakeven for equities (fixed stop in bracket)
+                        monitorBreakevenStop(p.symbol, entryPrice, stopLossOrderId).catch(() => {});
+                    }
+                    log("Equity BUY", p.symbol, "qty", cappedQty, "avg", toDollars(entryPrice));
+                } else {
+                    // OPTION: place market buy, then ONE reduce_only exit (trailing preferred)
+                    const body = {
+                        symbol: p.symbol,
+                        qty: cappedQty,
+                        side: "buy",
+                        type: "market",
+                        time_in_force: "day",
+                        asset_class: "option"
+                    };
+                    const buyOrder = await request("orders", API.TRADE, { method: "POST", body: JSON.stringify(body) });
+
+                    // Wait for fill
+                    let filled = null;
+                    let delay = 1000;
+                    for (let i = 0; i < 8; i++) {
+                        const st = await request(`orders/${buyOrder.id}`, API.TRADE);
+                        if (st.status === "filled") { filled = st; break; }
+                        await new Promise(res => setTimeout(res, delay));
+                        delay = Math.min(8000, Math.floor(delay * 1.6));
+                    }
+                    if (!filled) {
+                        const st = await request(`orders/${buyOrder.id}`, API.TRADE);
+                        if (st.status === "filled") filled = st;
+                    }
+                    if (!filled) {
+                        log(`Buy not filled in time: ${p.symbol}`);
+                        continue;
+                    }
+
+                    const entryPrice = parseFloat(filled.filled_avg_price || p.entryAsk || 0);
+
+                    // Use multiplier for spend accounting
                     let multForNotional = Number(p.multiplier);
                     if (!Number.isFinite(multForNotional) || multForNotional <= 0) {
                         multForNotional = await getOptionMultiplier(p.symbol).catch(() => 100);
                     }
-                    notional = toDollars(cappedQty * entryPrice * multForNotional);
-                } else {
-                    notional = toDollars(cappedQty * entryPrice);
+                    const notional = toDollars(cappedQty * entryPrice * multForNotional);
+                    moneySpent += notional;
+
+                    await placeOptionExitOrder({ symbol: p.symbol, qty: cappedQty, entryPrice }).catch(e =>
+                        log("Option exit placement failed:", e?.message || e)
+                    );
+
+                    log("Option BUY", p.symbol, "qty", cappedQty, "avg", toDollars(entryPrice));
                 }
 
-                moneySpent += notional;
-
-                // New: create shared client_order_id prefix for the sibling exits
-                const cidPrefix = `oco-${(p.underlying || p.symbol)}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,6)}`;
-
-                const exits = await placeCustomBracketOrders({
-                    symbol: p.symbol,
-                    qty: cappedQty,
-                    assetClass: p.assetClass,
-                    entryPrice,
-                    clientIdPrefix: cidPrefix
-                });
-
-                // Register OCO group for WS-driven sibling cancellation
-                registerOCOGroup(cidPrefix, p.symbol, exits);
-
-                if (!p.assetClass) {
-                    monitorBreakevenStop(p.symbol, entryPrice, exits.stopLossOrderId).catch(() => {});
-                }
-                log(p.assetClass ? "Option BUY" : "Equity BUY", p.symbol, "qty", cappedQty, "avg", toDollars(entryPrice));
-
-                // Mark the underlying as bought for the day (applies to equity and any options on the same ticker)
+                // Mark the underlying as bought for the day
                 tradedSymbolsToday.add(p.underlying || p.symbol);
 
                 // Schedule non-profit exit

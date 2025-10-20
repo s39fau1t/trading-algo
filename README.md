@@ -37,13 +37,14 @@ Notes:
 - Hybrid options + equity with custom exits:
   - For each candidate ticker, the planner maximizes dollar spend under the smallest of: per-ticker exposure cap (MAX_TRADE_PCT_OF_INITIAL_BP of initial buying power), daily remaining budget, and liquidity cap (minute volume × price × SPEND_MULT).
   - It evaluates a near‑ITM call (nearest expiry, strike <= target) and shares, then selects a single best leg (either one option leg or shares) per ticker per day. If options are not viable, it uses shares only.
-  - After a buy fills, it immediately places three exit legs:
-    - Stop loss: stop at STOP_PRICE_MULT of entry.
-    - Trailing stop: trailing_stop with fixed $ trail (PARAMS.TRAILING_STOP_DOLLARS).
-    - Take profit: limit at TAKE_PROFIT_PERCENT above entry.
-  - OCO race reduction: all three exits share a client_order_id prefix; a trade_updates WebSocket listener cancels the two sibling exits immediately when one fills (no polling).
-- Breakeven stop adjustment (equities):
-  - After an equity buy fills, if the price rises by BREAKEVEN_TRIGGER_DELTA above entry, the stop loss is moved to breakeven.
+  - Exits:
+    - Equities: a single broker-side bracket is submitted with the buy (order_class: bracket) containing:
+      - stop_loss: fixed stop at STOP_PRICE_MULT × reference price.
+      - take_profit: limit at TAKE_PROFIT_PERCENT above the reference price.
+      - This avoids over-reserving quantity and prevents HTTP 403 “insufficient qty available for order”.
+    - Options: exactly one reduce_only exit is placed after fill:
+      - trailing stop using TRAILING_STOP_DOLLARS when > 0; otherwise a fixed stop at STOP_PRICE_MULT × entry.
+  - Breakeven stop adjustment (equities only): if price rises by BREAKEVEN_TRIGGER_DELTA above entry, the bracket stop loss is moved to breakeven.
 - Exposure and sizing:
   - A single cap controls both per-trade spend and per-symbol exposure: MAX_TRADE_PCT_OF_INITIAL_BP (default 3% of the day’s initial buying power).
   - Exposure is tracked by underlying (equity + options market value) and includes pending allocations within the current batch.
@@ -73,7 +74,7 @@ Notes:
   - Trade submission per wave is sequentially paced to avoid bursty traffic; iterations still run as fast as the limits allow.
 - WebSocket trade updates:
   - The bot authenticates to Alpaca’s trading stream and listens for trade_updates.
-  - Exit orders are tagged with a shared client_order_id prefix; on a fill event for any exit, siblings are canceled immediately.
+  - Note: OCO sibling-cancel logic is no longer required for equities because the broker-side bracket maintains OCO. The stream remains available for future extensions and monitoring.
   - Automatic reconnect is implemented.
 
 - Safety and environment:
@@ -108,5 +109,6 @@ Operational tips:
 
 Troubleshooting:
 - If you see non‑JSON API responses, you may be rate‑limited or using the wrong domain/feed. The bot logs the HTTP status and partial body for diagnosis.
+- If you previously saw HTTP 403 with “insufficient qty available for order”, ensure you are on the bracket-based exits (equities) and single reduce_only exit (options). Submitting multiple full-qty exits in parallel will over-reserve the position and be rejected.
 - If trailing stops fail intermittently, the bot retries placement automatically; check logs for “Trailing stop placement failed” messages.
 - If you enable options, ensure your paper account supports them; otherwise, the planner will fall back to shares-only.
