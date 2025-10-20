@@ -82,7 +82,9 @@ Notes:
 
 Configuration quick reference (index.js PARAMS):
 - INTERVAL: Iteration interval in ms. Default: 30_000.
-- MAX_PER_DAY: Max total dollars to spend per day. Default: 2000.
+- MAX_PER_DAY: Max total dollars to spend per day.
+  - Default: 0 (use the full initial buying power reported by your Alpaca account at start of day).
+  - Set to a positive number (e.g., 2000) to cap the daily spend.
 - MIN_PRICE: Minimum stock price to consider. Default: 5.
 - MAX_TRADE_PCT_OF_INITIAL_BP: Fraction of initial day buying power used as both per‑trade and per‑symbol exposure cap. Default: 0.03 (3%).
 - SPEND_MULT: Liquidity cap multiplier (minute volume × ask × SPEND_MULT). Default: 0.05.
@@ -100,6 +102,12 @@ Configuration quick reference (index.js PARAMS):
   - PRICE_MAX: Max price for universe filter. Default: 1000.
   - ATR_DOLLARS_MIN: Min ATR14 in dollars (from daily bars). Default: 0.5.
   - ATR_LOOKBACK_DAYS: Daily bars window to compute ATR14 (needs >=15 to compute). Default: 15.
+
+Notes:
+- Daily budget:
+  - When MAX_PER_DAY <= 0, the bot will treat the daily budget as the full initial buying power reported by Alpaca at the start of the day.
+  - To limit total daily spend (e.g., to $2,000), set MAX_PER_DAY to that number.
+- The bot uses account.buying_power (fallback to cash) to determine initial buying power for the day.
 
 Operational tips:
 - Use "dump" any time to flatten immediately and pause trading; the bot stays running.

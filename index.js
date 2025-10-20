@@ -23,8 +23,8 @@ const RL_PER_SEC_SPAN = 1000;
 const PARAMS = {
     //Interval between each iteration of the algo (ms)
     INTERVAL: 30 * 1000,
-    //Max money spent per day (dollars)
-    MAX_PER_DAY: 2000,
+    //Max money spent per day (dollars). Set <= 0 to use full initial buying power.
+    MAX_PER_DAY: 0,
     //Minimum price of a stock before consider buying it (dollars)
     MIN_PRICE: 5,
     // Single cap for both per-stock exposure and per-trade spend,
@@ -671,11 +671,20 @@ let currentDayKey = null;
 // Add: track traded symbols per day
 let tradedSymbolsToday = new Set();
 
+// Effective daily budget resolver
+function getDailyBudget() {
+    const cap = Number(PARAMS.MAX_PER_DAY);
+    if (!Number.isFinite(cap) || cap <= 0) return toDollars(initialBuyingPower);
+    // Never exceed initial buying power for the day
+    return toDollars(Math.min(cap, initialBuyingPower));
+}
+
 async function ensureDayState() {
     const dayKey = getETDateKey();
     if (currentDayKey !== dayKey || !initialBuyingPower) {
         const account = await request("account", API.TRADE);
-        initialBuyingPower = parseFloat(account.cash || "0");
+        // Use buying_power when available; fallback to cash
+        initialBuyingPower = parseFloat((account.buying_power ?? account.cash) || "0");
         currentDayKey = dayKey;
         moneySpent = 0;
         tradedSymbolsToday.clear(); // Reset traded symbols on new day
@@ -1241,8 +1250,9 @@ async function algo() {
     // Wave-based batch buying to consume remaining allocation in one iteration
     let waves = 0;
     while (true) { // keep going until budget is exhausted or no more viable plans
-        let remainingAlloc = toDollars(Math.max(0, initialBuyingPower - moneySpent - 5));
-        let dailyRemainingNow = toDollars(Math.max(0, PARAMS.MAX_PER_DAY - moneySpent));
+        // Use the effective daily budget instead of raw initialBuyingPower or static MAX_PER_DAY
+        let remainingAlloc = toDollars(Math.max(0, getDailyBudget() - moneySpent - 5));
+        let dailyRemainingNow = toDollars(Math.max(0, getDailyBudget() - moneySpent));
         if (remainingAlloc < PARAMS.MIN_PRICE || dailyRemainingNow < PARAMS.MIN_PRICE) break;
 
         const batchPlans = [];
@@ -1394,7 +1404,8 @@ async function algo() {
         // loop re-evaluates remainingAlloc/dailyRemainingNow; will exit when exhausted or no plans left
     }
 
-    if (moneySpent + PARAMS.MIN_PRICE > PARAMS.MAX_PER_DAY) {
+    // End-of-iteration cleanup guard based on effective daily budget
+    if (moneySpent + PARAMS.MIN_PRICE > getDailyBudget()) {
         await cleanup();
     }
 }
