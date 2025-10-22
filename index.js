@@ -851,17 +851,10 @@ function buildOrderBody({ symbol, qty, side, type, tif = "gtc", assetClass, extr
 // Replace: ensure custom bracket legs include shared client_order_id prefix
 async function placeCustomBracketOrders({ symbol, qty, assetClass, entryPrice, clientIdPrefix }) {
     const takeProfitPrice = toDollars(entryPrice * (1 + PARAMS.TAKE_PROFIT_PERCENT / 100));
-    const stopLossPrice = Math.min(toDollars(entryPrice * PARAMS.STOP_PRICE_MULT), entryPrice - 0.01);
+    // Removed fixed stop; use trailing stop instead
+    let trailingStopOrder, takeProfitOrder;
 
-    let stopLossOrder, trailingStopOrder, takeProfitOrder;
     try {
-        stopLossOrder = await placeOrderWithRetry(
-            buildOrderBody({
-                symbol, qty, side: "sell", type: "stop", assetClass,
-                extra: { stop_price: stopLossPrice, client_order_id: `${clientIdPrefix}-sl` }
-            })
-        );
-
         trailingStopOrder = await placeOrderWithRetry(
             buildOrderBody({
                 symbol, qty, side: "sell", type: "trailing_stop", assetClass,
@@ -881,15 +874,16 @@ async function placeCustomBracketOrders({ symbol, qty, assetClass, entryPrice, c
             throw new Error("Trailing stop placement failed");
         }
     } catch (e) {
-        const ids = [stopLossOrder?.id, trailingStopOrder?.id, takeProfitOrder?.id].filter(Boolean);
+        const ids = [trailingStopOrder?.id, takeProfitOrder?.id].filter(Boolean);
         await Promise.all(ids.map(id =>
             request(`orders/${id}`, API.TRADE, { method: "DELETE" }).catch(() => {})
         ));
         throw e;
     }
 
+    // Keep shape for OCO tracking; stopLossOrderId is now null
     return {
-        stopLossOrderId: stopLossOrder.id,
+        stopLossOrderId: null,
         trailingStopOrderId: trailingStopOrder.id,
         takeProfitOrderId: takeProfitOrder.id
     };
@@ -1385,7 +1379,8 @@ async function algo() {
                 // Register OCO group for WS-driven sibling cancellation
                 registerOCOGroup(cidPrefix, p.symbol, exits);
 
-                if (!p.assetClass) {
+                // Only monitor breakeven if a fixed stop exists (now disabled)
+                if (!p.assetClass && exits.stopLossOrderId) {
                     monitorBreakevenStop(p.symbol, entryPrice, exits.stopLossOrderId).catch(() => {});
                 }
                 log(p.assetClass ? "Option BUY" : "Equity BUY", p.symbol, "qty", cappedQty, "avg", toDollars(entryPrice));

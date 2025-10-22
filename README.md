@@ -37,13 +37,12 @@ Notes:
 - Hybrid options + equity with custom exits:
   - For each candidate ticker, the planner maximizes dollar spend under the smallest of: per-ticker exposure cap (MAX_TRADE_PCT_OF_INITIAL_BP of initial buying power), daily remaining budget, and liquidity cap (minute volume × price × SPEND_MULT).
   - It evaluates a near‑ITM call (nearest expiry, strike <= target) and shares, then selects a single best leg (either one option leg or shares) per ticker per day. If options are not viable, it uses shares only.
-  - After a buy fills, it immediately places three exit legs:
-    - Stop loss: stop at STOP_PRICE_MULT of entry.
+  - After a buy fills, it immediately places two exit legs:
     - Trailing stop: trailing_stop with fixed $ trail (PARAMS.TRAILING_STOP_DOLLARS).
     - Take profit: limit at TAKE_PROFIT_PERCENT above entry.
-  - OCO race reduction: all three exits share a client_order_id prefix; a trade_updates WebSocket listener cancels the two sibling exits immediately when one fills (no polling).
+  - OCO race reduction: all exits share a client_order_id prefix; a trade_updates WebSocket listener cancels the sibling(s) immediately when one fills (no polling).
 - Breakeven stop adjustment (equities):
-  - After an equity buy fills, if the price rises by BREAKEVEN_TRIGGER_DELTA above entry, the stop loss is moved to breakeven.
+  - Disabled when using trailing stops instead of fixed stop-loss orders.
 - Exposure and sizing:
   - A single cap controls both per-trade spend and per-symbol exposure: MAX_TRADE_PCT_OF_INITIAL_BP (default 3% of the day’s initial buying power).
   - Exposure is tracked by underlying (equity + options market value) and includes pending allocations within the current batch.
@@ -89,7 +88,7 @@ Configuration quick reference (index.js PARAMS):
 - MAX_TRADE_PCT_OF_INITIAL_BP: Fraction of initial day buying power used as both per‑trade and per‑symbol exposure cap. Default: 0.03 (3%).
 - SPEND_MULT: Liquidity cap multiplier (minute volume × ask × SPEND_MULT). Default: 0.05.
 - LIMIT_PRICE_MULT: Not used for exits (custom exits are used). Kept for reference.
-- STOP_PRICE_MULT: Stop loss multiplier of entry. Default: 0.995 (0.5% below).
+- STOP_PRICE_MULT: Not used when stop orders are replaced by trailing stops.
 - TRAILING_STOP_DOLLARS: Fixed $ trailing amount. Default: 0.50.
 - TAKE_PROFIT_PERCENT: Take profit percent above entry. Default: 5.
 - BREAKEVEN_TRIGGER_DELTA: Equity-only; move stop to entry after this $ advance. Default: 0.50.
