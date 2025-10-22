@@ -539,29 +539,6 @@ async function getUnderlyingForOptionSymbols(symbols, batchSize = 200) {
 let universeToday = new Set();
 let universeBuiltDayKey = null;
 
-// New: compute ATR14 from daily bars
-function computeATR14(dailyBars = []) {
-    // Expect ascending by time; ensure fields for high/low/close
-    const bars = [...dailyBars].sort((a, b) => Date.parse(a.t || a.time || 0) - Date.parse(b.t || b.time || 0));
-    if (bars.length < 15) return 0;
-
-    const tr = [];
-    let prevClose = Number(bars[0].c);
-    for (let i = 1; i < bars.length; i++) {
-        const h = Number(bars[i].h);
-        const l = Number(bars[i].l);
-        const cPrev = Number(prevClose);
-        const range = Math.max(h - l, Math.abs(h - cPrev), Math.abs(l - cPrev));
-        tr.push(range);
-        prevClose = Number(bars[i].c);
-    }
-    // Use last 14 TR values
-    const last14 = tr.slice(-14);
-    if (last14.length < 14) return 0;
-    const sum = last14.reduce((a, b) => a + (Number.isFinite(b) ? b : 0), 0);
-    return sum / 14;
-}
-
 // New: build the daily static universe (price range, ATR)
 async function buildDailyUniverse(baseSymbols) {
     const dayKey = getETDateKey();
@@ -590,50 +567,14 @@ async function buildDailyUniverse(baseSymbols) {
         return;
     }
 
-    // Step 2 (now): ATR14 from daily bars (last ~15 days)
-    const atrBySymbol = {};
-    const daysBack = Math.max(20, cfg.ATR_LOOKBACK_DAYS + 6);
-    const start = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString();
-    for (let i = 0; i < priceFiltered.length; i += 200) {
-        const batch = priceFiltered.slice(i, i + 200);
-        const resp = await request("stocks/bars", API.DATA, {
-            params: {
-                symbols: batch,
-                timeframe: "1Day",
-                start,
-                feed: "iex"
-            }
-        });
-        const map = normalizeBarsMap(resp);
-        for (const sym of batch) {
-            const bars = map[sym] || [];
-            const atr = computeATR14(bars);
-            if (Number.isFinite(atr)) atrBySymbol[sym] = atr;
-        }
-    }
-
+    // Removed: ATR computation and filter. Universe is price-only.
     for (const sym of priceFiltered) {
-        if ((atrBySymbol[sym] || 0) >= cfg.ATR_DOLLARS_MIN) {
-            set.add(sym);
-        }
+        set.add(sym);
     }
 
     universeToday = set;
     universeBuiltDayKey = dayKey;
-    log(`Universe built: ${set.size} symbols (price in [${cfg.PRICE_MIN}, ${cfg.PRICE_MAX}], ATR14 >= ${cfg.ATR_DOLLARS_MIN}).`);
-}
-
-// New: ensure universe is built once per ET day after open+lookback
-async function ensureUniverseBuilt(baseSymbols) {
-    const dayKey = getETDateKey();
-    if (universeBuiltDayKey === dayKey && universeToday.size > 0) return;
-
-    const { hour, minute } = getEasternTimeParts();
-    const nowMins = hour * 60 + minute;
-    const startMins = getTradingStartMinutesET();
-    if (nowMins >= startMins) {
-        await buildDailyUniverse(baseSymbols);
-    }
+    log(`Universe built: ${set.size} symbols (price in [${cfg.PRICE_MIN}, ${cfg.PRICE_MAX}]).`);
 }
 
 // Fix: missing helper to get option multiplier
