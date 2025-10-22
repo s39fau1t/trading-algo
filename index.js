@@ -590,6 +590,21 @@ async function getOptionMultiplier(optionSymbol) {
     }
 }
 
+// New: ensure the static daily universe is built once per ET trading day (at/after start time)
+async function ensureUniverseBuilt(baseSymbols) {
+    const dayKey = getETDateKey();
+    if (universeBuiltDayKey === dayKey) return;
+
+    const { hour, minute } = getEasternTimeParts();
+    const nowMins = hour * 60 + minute;
+    const startMins = getTradingStartMinutesET();
+
+    // Do not build before the allowed trading start time (e.g., 09:40 ET)
+    if (nowMins < startMins) return;
+
+    await buildDailyUniverse(baseSymbols);
+}
+
 const assetsResp = await request("assets", API.TRADE, {
     params: {
         status: "active",
