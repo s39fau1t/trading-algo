@@ -192,6 +192,8 @@ let tradingPaused = false;
 let offHoursActive = false;
 // Add: track if pause was caused by off-hours so we can auto-resume at open
 let pausedByOffHours = false;
+// Add: pause version to abort in-flight iterations on "dump"
+let pauseVersion = 0;
 
 // --- Terminal countdown progress bar ---
 let handle; // reuses the existing handle variable for the progress timer
@@ -1099,7 +1101,8 @@ async function revalidateAndCapQtyBeforeBuy(plan, perTradeCap) {
 
 async function algo() {
     log("Iteration start");
-
+    // Capture pause version at iteration start
+    const myPauseVersion = pauseVersion;
     // Enforce no trading/no orders/no positions during off-hours (15:30 -> 09:40 ET)
     if (await enforceOffHours()) {
         return;
@@ -1200,6 +1203,12 @@ async function algo() {
     // Wave-based batch buying to consume remaining allocation in one iteration
     let waves = 0;
     while (true) { // keep going until budget is exhausted or no more viable plans
+        // Abort this iteration if paused mid-run
+        if (tradingPaused || myPauseVersion !== pauseVersion) {
+            log("Pause detected mid-iteration. Aborting iteration.");
+            return;
+        }
+
         // Use the effective daily budget instead of raw initialBuyingPower or static MAX_PER_DAY
         let remainingAlloc = toDollars(Math.max(0, getDailyBudget() - moneySpent - 5));
         let dailyRemainingNow = toDollars(Math.max(0, getDailyBudget() - moneySpent));
@@ -1257,8 +1266,20 @@ async function algo() {
 
         if (batchPlans.length === 0) break;
 
+        // Abort before executing any planned orders
+        if (tradingPaused || myPauseVersion !== pauseVersion) {
+            log("Pause detected before order execution. Skipping remaining orders.");
+            return;
+        }
+
         // Execute planned buys sequentially to avoid bursts, still fast under dual limiter
         for (const p of batchPlans) {
+            // Guard each order against mid-iteration dumps
+            if (tradingPaused || myPauseVersion !== pauseVersion) {
+                log("Pause detected during order execution. Aborting remaining buys.");
+                return;
+            }
+
             try {
                 const cap = toDollars(initialBuyingPower * PARAMS.MAX_TRADE_PCT_OF_INITIAL_BP);
                 const { qty: cappedQty } = await revalidateAndCapQtyBeforeBuy(p, cap);
@@ -1384,6 +1405,7 @@ rl.on("line", async (raw) => {
 
     if (cmd === "dump") {
         tradingPaused = true; // immediately prevent new orders
+        pauseVersion++; // ensure current iteration aborts ASAP
         log('Command: "dump" received -> flattening and pausing trading.');
         await flattenAndCancel();
         log('Dump complete. Trading remains paused until "pump".');
