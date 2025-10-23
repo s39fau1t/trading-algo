@@ -120,6 +120,7 @@ function connectTradeUpdates() {
                     const ev = data.event; // e.g., "fill", "partial_fill", "canceled", etc.
                     const order = data.order || {};
                     const cid = order.client_order_id || order.client_order_id?.toString() || "";
+                    // Only consider orders explicitly tagged with our OCO prefix
                     if (!cid || !cid.startsWith("oco-")) return;
 
                     // Expect suffix -sl | -ts | -tp
@@ -127,16 +128,22 @@ function connectTradeUpdates() {
                     const group = ocoGroups.get(prefix);
                     if (!group || group.done) return;
 
+                    // Only cancel siblings if an EXIT leg filled (TP/TS/SL), not the entry
                     if (ev === "fill") {
                         const filledId = order.id;
-                        const siblings = [
+                        const exitIds = [
                             group.ids.stopLossOrderId,
                             group.ids.trailingStopOrderId,
                             group.ids.takeProfitOrderId
-                        ].filter(id => id && id !== filledId);
+                        ].filter(Boolean);
 
+                        // Guard: act only if the filled order is one of our exit orders
+                        const isExitFill = exitIds.includes(filledId);
+                        if (!isExitFill) return;
+
+                        const siblings = exitIds.filter(id => id !== filledId);
                         if (siblings.length) {
-                            log(`Trade update fill for ${order.symbol} (${cid}); canceling ${siblings.length} sibling(s).`);
+                            log(`Exit filled for ${order.symbol} (${cid}); canceling ${siblings.length} sibling(s).`);
                             await Promise.all(siblings.map(id =>
                                 request(`orders/${id}`, API.TRADE, { method: "DELETE" }).catch(() => {})
                             ));
@@ -1297,12 +1304,17 @@ async function algo() {
                     log(`Cap ${p.symbol}: qty ${p.qty} -> ${cappedQty} (per-trade/volume)`);
                 }
 
+                // New: create shared client_order_id prefix for the sibling exits
+                const cidPrefix = `oco-${(p.underlying || p.symbol)}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,6)}`;
+
+                // Entry order MUST NOT use the OCO prefix; tag with a distinct prefix to avoid accidental OCO handling
                 const body = {
                     symbol: p.symbol,
                     qty: cappedQty,
                     side: "buy",
                     type: "market",
                     time_in_force: "day",
+                    client_order_id: `entry-${(p.underlying || p.symbol)}-${Date.now().toString(36)}`, // explicit non-OCO tag
                     ...(p.assetClass === "option" ? { asset_class: "option" } : {})
                 };
                 const buyOrder = await request("orders", API.TRADE, { method: "POST", body: JSON.stringify(body) });
@@ -1342,9 +1354,6 @@ async function algo() {
 
                 moneySpent += notional;
 
-                // New: create shared client_order_id prefix for the sibling exits
-                const cidPrefix = `oco-${(p.underlying || p.symbol)}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,6)}`;
-
                 const exits = await placeCustomBracketOrders({
                     symbol: p.symbol,
                     qty: cappedQty,
@@ -1353,7 +1362,7 @@ async function algo() {
                     clientIdPrefix: cidPrefix
                 });
 
-                // Register OCO group for WS-driven sibling cancellation
+                // Register OCO group for WS-driven sibling cancellation (only between TP and TS)
                 registerOCOGroup(cidPrefix, p.symbol, exits);
 
                 // Only monitor breakeven if a fixed stop exists (now disabled)
