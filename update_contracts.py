@@ -33,9 +33,6 @@ symbols = get_symbols()
 contracts = ib.qualifyContracts(*[Stock(symbol, 'SMART', 'USD') for symbol in symbols])
 
 with open('contracts.json', 'w') as file:
-    json.dump([{
-        'conId': contract.conId,
-        'symbol': contract.symbol
-    } for contract in contracts if contract != None], file)
+    json.dump([contract.__dict__ for contract in contracts if contract != None], file)
 
 ib.disconnect()
