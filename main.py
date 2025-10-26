@@ -1,7 +1,10 @@
+# TODO
 from ib_async import *
 
 import json
 import asyncio
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # TODO: we should utilize multithreading to get the most out of cpu
 
@@ -33,47 +36,85 @@ PARAMS = {
     }
 }
 
-# TODO: is a separate script needed??
-# TODO: where put this
-# TODO: what to do when file does not exist?
-with open('contracts.json') as file:
-    contracts = [Contract(**obj) for obj in json.load(file)]
-
 # TODO: errors?
-def get_account_value(account, tag):
+def get_account_value(account: list[AccountValue], tag: str):
     for value in account:
         if value.tag == tag:
             return value.value
 
-def get_position(positions, symbol):
+def get_position(positions: list[Position], symbol: str):
     for position in positions:
         if position.contract.symbol == symbol:
             return position.position
 
+def get_time_est():
+    return datetime.now(ZoneInfo('US/Eastern'))
+
+async def cleanup(ib: IB):
+    now = get_time_est()
+    cleanup_time = now.replace(
+        hour=PARAMS['CLOSING']['HOURS'],
+        minute=PARAMS['CLOSING']['MINUTES']
+    )
+
+    # timestamp is in ms, convert to s for sleep
+    await asyncio.sleep((cleanup_time.timestamp - now.timestamp) / 1000)
+
+    # cancel all orders
+    ib.reqGlobalCancel()
+
+    positions = ib.positions()
+    for position in positions:
+        sell_order = Order(
+            action='SELL',
+            orderType='MKT',
+            # TODO: qty or dollars???
+            totalQuantity=position.position
+        )
+
+        ib.placeOrder(position.contract, sell_order)
+
 #TODO
-async def algo(ib: IB):
-    # TODO: stopping, cleanup
+async def algo(ib: IB, contracts: list[Contract]):
+    stop = False
 
+    now = get_time_est()
+
+    if now.hour == PARAMS['CLOSING']['HOURS'] and now.minute + PARAMS['INTERVAL'] / 60 >= PARAMS['CLOSING']['MINUTES']:
+        stop = True
+
+    # TODO: move inside loop?? yes!!
     account_name, = ib.managedAccounts()
-    account = await ib.accountSummaryAsync(account_name)
 
-    buying_power = float(get_account_value(account, 'BuyingPower'))
-    equity = float(get_account_value(account, 'TotalCashValue'))
+    positions = ib.positions(account_name)
 
     for contract in contracts:
-        positions = ib.positions(account_name)
-        cur_position = get_position(positions, contract.symbol)
+        # request account and market data simultaneously to save time
+        account, (ticker,) = await asyncio.gather(
+            ib.accountSummaryAsync(account_name),
+            ib.reqTickersAsync(contract)
+        )
 
-        # TODO: check PARAMS['MAX_PERCENTAGE_PER_STOCK']
+        buying_power = float(get_account_value(account, 'BuyingPower'))
+        equity = float(get_account_value(account, 'TotalCashValue'))
 
-        ticker, = await ib.reqTickers(contract)
+        # estimate the current value of the position in dollars
+        position_value = get_position(positions, contract.symbol) * ticker.marketPrice()
 
         notional = min(
             ticker.volume * ticker.ask * PARAMS['SPEND_MULT'],
             buying_power * PARAMS['MAX_BUYING_POWER_AT_ONCE']
         )
 
-        qty = notional / ticker.marketPrice()
+        max_dollars = equity * PARAMS['MAX_PERCENTAGE_PER_STOCK']
+
+        if position_value + notional > max_dollars:
+            notional = max_dollars - position_value
+
+        qty = int(notional / ticker.marketPrice())
+
+        if qty == 0:
+            continue
 
         # TODO: MAX_PER_DAY
 
@@ -84,8 +125,11 @@ async def algo(ib: IB):
 
         parent = Order(
             action='BUY',
-            orderType='MKT',
+            #orderType='MKT',
+            orderType='LMT',
             totalQuantity=qty,
+            # TODO
+            lmtPrice=ticker.ask,
             orderId=ib.client.getReqId(),
             transmit=False
         )
@@ -94,7 +138,7 @@ async def algo(ib: IB):
             action='SELL',
             orderType='LMT',
             totalQuantity=qty,
-            lmtPrice=ticker.ask * PARAMS['LIMIT_PRICE_MULT'],
+            lmtPrice=round(ticker.ask * PARAMS['LIMIT_PRICE_MULT'], 2),
             parentId=parent.orderId,
             transmit=False
         )
@@ -113,9 +157,18 @@ async def algo(ib: IB):
         ib.placeOrder(contract, take_profit)
         ib.placeOrder(contract, trailing_stop)
 
-    return True
+    if stop:
+        await cleanup(ib)
 
-async def loop():
+    return stop
+
+async def main():
+    # TODO: is a separate script needed??
+    # TODO: where put this
+    # TODO: what to do when file does not exist?
+    with open('contracts.json') as file:
+        contracts = [Contract(**obj) for obj in json.load(file)]
+
     ib = IB()
     # TODO: let user select port
     await ib.connectAsync(port=7497)
@@ -126,6 +179,7 @@ async def loop():
     looping = True
 
     while looping:
-        looping = await asyncio.gather(algo(ib), asyncio.sleep(PARAMS['INTERVAL']))
+        # TODO: this will loop an extra time on the last iteration
+        looping = await asyncio.gather(algo(ib, contracts), asyncio.sleep(PARAMS['INTERVAL']))
 
-asyncio.run(loop())
+asyncio.run(main())
