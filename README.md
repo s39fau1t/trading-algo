@@ -35,12 +35,12 @@ Notes:
   - No positions or open orders are allowed and no new trades are placed.
   - Trading auto-resumes at 9:40 AM ET unless you manually paused it; "pump" cannot override the off-hours restriction.
 - Hybrid options + equity with custom exits:
-  - For each candidate ticker, the planner maximizes dollar spend under the smallest of: per-ticker exposure cap (MAX_TRADE_PCT_OF_INITIAL_BP of initial buying power), daily remaining budget, and liquidity cap (minute volume × price × SPEND_MULT).
-  - It evaluates a near‑ITM call (nearest expiry, strike <= target) and shares, then selects a single best leg (either one option leg or shares) per ticker per day. If options are not viable, it uses shares only.
-  - After a buy fills, it immediately places two exit legs:
-    - Trailing stop: trailing_stop with fixed $ trail (PARAMS.TRAILING_STOP_DOLLARS).
+  - For equities, exits are now placed using a single server‑side OCO order (Alpaca manages both legs):
     - Take profit: limit at TAKE_PROFIT_PERCENT above entry.
-  - OCO race reduction: all exits share a client_order_id prefix; a trade_updates WebSocket listener cancels the sibling(s) immediately when one fills (no polling).
+    - Trailing stop: trailing_stop with fixed $ trail (PARAMS.TRAILING_STOP_DOLLARS).
+    - Using OCO avoids the broker rejecting the second leg for “insufficient position” and prevents the program from canceling a successfully placed first leg.
+  - For options, OCO isn’t supported by Alpaca. The bot places a take‑profit limit order only as a safe fallback.
+  - If OCO placement ever fails (e.g., transient error), the bot falls back to a TP‑only exit to ensure at least one managed exit is present.
 - Breakeven stop adjustment (equities):
   - Disabled when using trailing stops instead of fixed stop-loss orders.
 - Exposure and sizing:
@@ -70,7 +70,8 @@ Notes:
   - Dual token buckets throttle all API calls to both 10 requests/second and 200 requests/minute.
   - Trade submission per wave is sequentially paced to avoid bursty traffic; iterations still run as fast as the limits allow.
 - WebSocket trade updates:
-  - The bot authenticates to Alpaca’s trading stream and listens for trade_updates.
+  - For equities, sibling cancellation is performed by Alpaca’s OCO; the bot no longer manually cancels exit siblings.
+  - The bot still auto‑reconnects and listens for trade updates for logging and safety.
   - Exit orders are tagged with a shared client_order_id prefix; on a fill event for any exit, siblings are canceled immediately.
   - Automatic reconnect is implemented.
 

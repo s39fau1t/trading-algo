@@ -814,44 +814,86 @@ function buildOrderBody({ symbol, qty, side, type, tif = "gtc", assetClass, extr
 }
 
 // Replace: ensure custom bracket legs include shared client_order_id prefix
-async function placeCustomBracketOrders({ symbol, qty, assetClass, entryPrice, clientIdPrefix }) {
+async function placeCustomBracketOrders({ symbol, qty, assetClass, entryPrice /*, clientIdPrefix*/ }) {
     const takeProfitPrice = toDollars(entryPrice * (1 + PARAMS.TAKE_PROFIT_PERCENT / 100));
-    // Removed fixed stop; use trailing stop instead
-    let trailingStopOrder, takeProfitOrder;
+    const trailAmt = toDollars(PARAMS.TRAILING_STOP_DOLLARS || 0.5);
 
-    try {
-        trailingStopOrder = await placeOrderWithRetry(
-            buildOrderBody({
-                symbol, qty, side: "sell", type: "trailing_stop", assetClass,
-                extra: { trail_price: toDollars(PARAMS.TRAILING_STOP_DOLLARS || 0.5), client_order_id: `${clientIdPrefix}-ts` }
-            }),
-            4
-        );
-
-        takeProfitOrder = await placeOrderWithRetry(
-            buildOrderBody({
-                symbol, qty, side: "sell", type: "limit", assetClass,
-                extra: { limit_price: takeProfitPrice, client_order_id: `${clientIdPrefix}-tp` }
-            })
-        );
-
-        if (!trailingStopOrder?.id) {
-            throw new Error("Trailing stop placement failed");
+    // For options: OCO isn't supported. Place a TP-only reduce leg to ensure at least one managed exit exists.
+    if (assetClass === "option") {
+        try {
+            const tpOrder = await placeOrderWithRetry(
+                buildOrderBody({
+                    symbol, qty, side: "sell", type: "limit", assetClass,
+                    // Options TIF: use "day" for widest compatibility
+                    tif: "day",
+                    extra: { limit_price: takeProfitPrice }
+                })
+            );
+            return {
+                stopLossOrderId: null,
+                trailingStopOrderId: null,
+                takeProfitOrderId: tpOrder?.id || null,
+                // Not a manual OCO pairing
+                manual: false
+            };
+        } catch (e) {
+            throw new Error(`Option TP placement failed: ${e?.message || e}`);
         }
-    } catch (e) {
-        const ids = [trailingStopOrder?.id, takeProfitOrder?.id].filter(Boolean);
-        await Promise.all(ids.map(id =>
-            request(`orders/${id}`, API.TRADE, { method: "DELETE" }).catch(() => {})
-        ));
-        throw e;
     }
 
-    // Keep shape for OCO tracking; stopLossOrderId is now null
-    return {
-        stopLossOrderId: null,
-        trailingStopOrderId: trailingStopOrder.id,
-        takeProfitOrderId: takeProfitOrder.id
-    };
+    // Equities: submit server-side OCO so Alpaca manages sibling reservation/cancellation.
+    try {
+        const resp = await request("orders", API.TRADE, {
+            method: "POST",
+            body: JSON.stringify({
+                symbol,
+                qty,
+                side: "sell",
+                type: "limit",          // parent type; children inherit their own types
+                time_in_force: "gtc",
+                order_class: "oco",
+                take_profit: { limit_price: takeProfitPrice },
+                stop_loss: { trail_price: trailAmt }
+            })
+        });
+
+        // Extract child legs' ids (TP and TS)
+        let takeProfitOrderId = null;
+        let trailingStopOrderId = null;
+        const legs = Array.isArray(resp?.legs) ? resp.legs : [];
+        for (const leg of legs) {
+            if (leg?.type === "limit") takeProfitOrderId = leg.id || takeProfitOrderId;
+            if (leg?.type === "trailing_stop") trailingStopOrderId = leg.id || trailingStopOrderId;
+        }
+
+        return {
+            stopLossOrderId: null,
+            trailingStopOrderId,
+            takeProfitOrderId,
+            // Server-side OCO; no manual cancellation required
+            manual: false
+        };
+    } catch (e) {
+        // As a safe fallback, place TP-only so at least one managed exit exists.
+        try {
+            const tpOrder = await placeOrderWithRetry(
+                buildOrderBody({
+                    symbol, qty, side: "sell", type: "limit",
+                    tif: "gtc",
+                    extra: { limit_price: takeProfitPrice }
+                })
+            );
+            log(`OCO placement failed; placed TP-only for ${symbol} at ${takeProfitPrice}. Reason: ${e?.message || e}`);
+            return {
+                stopLossOrderId: null,
+                trailingStopOrderId: null,
+                takeProfitOrderId: tpOrder?.id || null,
+                manual: false
+            };
+        } catch (e2) {
+            throw new Error(`OCO and TP-only failed: ${e2?.message || e2}`);
+        }
+    }
 }
 
 // Add: enforce off-hours state (flat positions, no open orders, pause trading)
@@ -1304,10 +1346,7 @@ async function algo() {
                     log(`Cap ${p.symbol}: qty ${p.qty} -> ${cappedQty} (per-trade/volume)`);
                 }
 
-                // New: create shared client_order_id prefix for the sibling exits
-                const cidPrefix = `oco-${(p.underlying || p.symbol)}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,6)}`;
-
-                // Entry order MUST NOT use the OCO prefix; tag with a distinct prefix to avoid accidental OCO handling
+                // Entry order MUST NOT use any OCO prefix
                 const body = {
                     symbol: p.symbol,
                     qty: cappedQty,
@@ -1358,14 +1397,10 @@ async function algo() {
                     symbol: p.symbol,
                     qty: cappedQty,
                     assetClass: p.assetClass,
-                    entryPrice,
-                    clientIdPrefix: cidPrefix
+                    entryPrice
                 });
 
-                // Register OCO group for WS-driven sibling cancellation (only between TP and TS)
-                registerOCOGroup(cidPrefix, p.symbol, exits);
-
-                // Only monitor breakeven if a fixed stop exists (now disabled)
+                // Only monitor breakeven if a fixed stop exists (still disabled for trailing-only)
                 if (!p.assetClass && exits.stopLossOrderId) {
                     monitorBreakevenStop(p.symbol, entryPrice, exits.stopLossOrderId).catch(() => {});
                 }
