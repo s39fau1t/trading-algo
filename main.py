@@ -68,7 +68,6 @@ async def cleanup(ib: IB):
         sell_order = Order(
             action='SELL',
             orderType='MKT',
-            # TODO: qty or dollars???
             totalQuantity=position.position
         )
 
@@ -83,7 +82,6 @@ async def algo(ib: IB, contracts: list[Contract]):
     if now.hour == PARAMS['CLOSING']['HOURS'] and now.minute + PARAMS['INTERVAL'] / 60 >= PARAMS['CLOSING']['MINUTES']:
         stop = True
 
-    # TODO: move inside loop?? yes!!
     account_name, = ib.managedAccounts()
 
     positions = ib.positions(account_name)
@@ -99,7 +97,7 @@ async def algo(ib: IB, contracts: list[Contract]):
         equity = float(get_account_value(account, 'TotalCashValue'))
 
         # estimate the current value of the position in dollars
-        position_value = get_position(positions, contract.symbol) * ticker.marketPrice()
+        position_value = get_position(positions, contract.symbol) or 0 * ticker.marketPrice()
 
         notional = min(
             ticker.volume * ticker.ask * PARAMS['SPEND_MULT'],
@@ -119,7 +117,6 @@ async def algo(ib: IB, contracts: list[Contract]):
         # TODO: MAX_PER_DAY
 
         # place bracket order
-        # TODO: fractional??
 
         # https://interactivebrokers.github.io/tws-api/available_orders.html
 
