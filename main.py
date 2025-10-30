@@ -11,6 +11,10 @@ import contract
 
 # TODO: we should utilize multithreading to get the most out of cpu
 
+# TODO: figure out ask vs market_price vs bid??
+
+# TODO: rounding for dollar amounts??
+
 # TODO: toml config?
 PARAMS = {
     # Interval between each iteration of the algo (seconds)
@@ -25,11 +29,8 @@ PARAMS = {
     'SPEND_MULT': 0.05,
     # Maximum percentage of buying power that can be spent on a particular stock at once
     'MAX_BUYING_POWER_AT_ONCE': 0.02,
-    # TODO
     # Multiplier to calculate the take profit price for bracket orders (ask price * LIMIT_PRICE_MULT = limit_price)
     'LIMIT_PRICE_MULT': 1.1,
-    # Multiplier to calculate the stop price (ask price * STOP_PRICE_MULT = stop_price)
-    'STOP_PRICE_MULT': 0.995,
     # Percent away from the highest water mark for trailing stop orders
     'TRAILING_STOP_PERCENT': 1,
     # Time to cancel all orders and close out of all positions (24-hr, eastern time)
@@ -61,7 +62,7 @@ async def cleanup(ib: IB):
     )
 
     # timestamp is in ms, convert to s for sleep
-    await asyncio.sleep((cleanup_time.timestamp - now.timestamp) / 1000)
+    await asyncio.sleep((cleanup_time.timestamp() - now.timestamp()) / 1000)
 
     # cancel all orders
     ib.reqGlobalCancel()
@@ -77,7 +78,7 @@ async def cleanup(ib: IB):
         ib.placeOrder(position.contract, sell_order)
 
 #TODO
-async def algo(ib: IB, contracts: list[Contract]):
+async def algo(ib: IB, contracts: list[Contract], money_spent: float):
     stop = False
 
     now = get_time_est()
@@ -96,6 +97,7 @@ async def algo(ib: IB, contracts: list[Contract]):
             ib.reqTickersAsync(contract)
         )
 
+        # TODO: use buying power or cash?
         buying_power = float(get_account_value(account, 'BuyingPower'))
         equity = float(get_account_value(account, 'TotalCashValue'))
 
@@ -107,28 +109,30 @@ async def algo(ib: IB, contracts: list[Contract]):
             buying_power * PARAMS['MAX_BUYING_POWER_AT_ONCE']
         )
 
-        max_dollars = equity * PARAMS['MAX_PERCENTAGE_PER_STOCK']
+        stock_max_dollars = equity * PARAMS['MAX_PERCENTAGE_PER_STOCK']
 
-        if position_value + notional > max_dollars:
-            notional = max_dollars - position_value
+        # TODO: should these be together
+        if position_value + notional > stock_max_dollars or money_spent + notional > PARAMS['MAX_PER_DAY']:
+            notional = min(stock_max_dollars - position_value, PARAMS['MAX_PER_DAY'] - money_spent)
 
         qty = int(notional / ticker.marketPrice())
 
+        # also ensures we don't go over MAX_PER_DAY
         if qty == 0:
             continue
 
-        # TODO: MAX_PER_DAY
+        # worst case money spent; TODO: is that right?
+        money_spent += round(qty * ticker.ask, 2)
+
+        print(f'buying {qty} shares of {contract.symbol} with estimated spending {qty * ticker.ask} and current total spending {money_spent}')
 
         # place bracket order
-
         # https://interactivebrokers.github.io/tws-api/available_orders.html
 
         parent = Order(
             action='BUY',
-            #orderType='MKT',
             orderType='LMT',
             totalQuantity=qty,
-            # TODO
             lmtPrice=ticker.ask,
             orderId=ib.client.getReqId(),
             transmit=False
@@ -148,7 +152,6 @@ async def algo(ib: IB, contracts: list[Contract]):
             orderType='TRAIL',
             totalQuantity=qty,
             trailingPercent=PARAMS['TRAILING_STOP_PERCENT'],
-            #trailStopPrice=?
             parentId=parent.orderId,
             transmit=True
         )
@@ -157,10 +160,14 @@ async def algo(ib: IB, contracts: list[Contract]):
         ib.placeOrder(contract, take_profit)
         ib.placeOrder(contract, trailing_stop)
 
+        if money_spent + PARAMS['MIN_PRICE'] > PARAMS['MAX_PER_DAY']:
+            stop = True
+            break
+
     if stop:
         await cleanup(ib)
 
-    return stop
+    return (stop, money_spent)
 
 async def main(contracts: list[Contract], port: int):
     ib = IB()
@@ -169,11 +176,14 @@ async def main(contracts: list[Contract], port: int):
     # use delayed data
     ib.reqMarketDataType(3)
 
-    looping = True
+    stop = False
+    money_spent = 0
 
-    while looping:
+    while not stop:
         # TODO: this will loop an extra time on the last iteration
-        looping = await asyncio.gather(algo(ib, contracts), asyncio.sleep(PARAMS['INTERVAL']))
+        (stop, money_spent) = await asyncio.gather(algo(ib, contracts, money_spent), asyncio.sleep(PARAMS['INTERVAL']))
+
+    ib.disconnect()
 
 # Get the port from command line args
 parser = ArgumentParser(prog='uv run main.py', epilog='Note: Port argument must match with whatever is selected in TWS otherwise it will not connect')
@@ -190,6 +200,8 @@ elif args.paper:
 else:
     port = args.port
 
+# try to get contracts from cache, if not request them and store in cache
+# TODO: when should cache be updated
 try:
     contracts = contract.read_contracts('contracts.json')
 except FileNotFoundError:
