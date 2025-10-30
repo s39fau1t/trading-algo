@@ -5,6 +5,7 @@ import json
 import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from argparse import ArgumentParser
 
 # TODO: we should utilize multithreading to get the most out of cpu
 
@@ -159,16 +160,9 @@ async def algo(ib: IB, contracts: list[Contract]):
 
     return stop
 
-async def main():
-    # TODO: is a separate script needed??
-    # TODO: where put this
-    # TODO: what to do when file does not exist?
-    with open('contracts.json') as file:
-        contracts = [Contract(**obj) for obj in json.load(file)]
-
+async def main(contracts: list[Contract], port: int):
     ib = IB()
-    # TODO: let user select port
-    await ib.connectAsync(port=7497)
+    await ib.connectAsync(port=port)
 
     # use delayed data
     ib.reqMarketDataType(3)
@@ -179,4 +173,25 @@ async def main():
         # TODO: this will loop an extra time on the last iteration
         looping = await asyncio.gather(algo(ib, contracts), asyncio.sleep(PARAMS['INTERVAL']))
 
-asyncio.run(main())
+# Get the port from command line args
+parser = ArgumentParser(prog='uv run main.py', epilog='Note: Port argument must match with whatever is selected in TWS otherwise it will not connect')
+group = parser.add_mutually_exclusive_group(required=True)
+group.add_argument('--live', action='store_true', help='connect to TWS over the default live trading port')
+group.add_argument('--paper', action='store_true', help='connect to TWS over the default paper trading port')
+group.add_argument('--port', type=int, help='connect to TWS over a custom port')
+
+args = parser.parse_args()
+if args.live:
+    port = 7496
+elif args.paper:
+    port = 7497
+else:
+    port = args.port
+
+# TODO: is a separate script needed??
+# TODO: where put this
+# TODO: what to do when file does not exist?
+with open('contracts.json') as file:
+    contracts = [Contract(**obj) for obj in json.load(file)]
+
+asyncio.run(main(contracts, port))
