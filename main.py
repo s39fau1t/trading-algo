@@ -7,6 +7,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from argparse import ArgumentParser
 
+import contract
+
 # TODO: we should utilize multithreading to get the most out of cpu
 
 # TODO: toml config?
@@ -188,10 +190,15 @@ elif args.paper:
 else:
     port = args.port
 
-# TODO: is a separate script needed??
-# TODO: where put this
-# TODO: what to do when file does not exist?
-with open('contracts.json') as file:
-    contracts = [Contract(**obj) for obj in json.load(file)]
+try:
+    contracts = contract.read_contracts('contracts.json')
+except FileNotFoundError:
+    print('no contract cache, requesting contracts (this may take a while)')
+
+    contracts = contract.get_contracts(port)
+
+    contract.save_contracts('contracts.json', contracts)
+
+print('starting algo...')
 
 asyncio.run(main(contracts, port))
