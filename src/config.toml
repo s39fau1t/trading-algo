@@ -1,0 +1,18 @@
+# Interval between each iteration of the algo (minutes)
+interval = 10
+# Max money spent per day (dollars)
+max_per_day = 2000
+# Minimum price of a stock before consider buying it (dollars)
+min_price = 5
+# Maximum percentage of the portfolio that can be one stock
+max_percentage_per_stock = 0.03
+# Multiplier for the amount to spend on a particular stock
+spend_mult = 0.05
+# Maximum percentage of buying power that can be spent on a particular stock at once
+max_buying_power_at_once = 0.02
+# Multiplier to calculate the take profit price for bracket orders (ask price * LIMIT_PRICE_MULT = limit_price)
+limit_price_mult = 1.1
+# Percent away from the highest water mark for trailing stop orders
+trailing_stop_percent = 1
+# Time to cancel all orders and close out of all positions (24-hr, eastern time)
+closing = 15:30:00

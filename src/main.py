@@ -1,7 +1,7 @@
 # TODO
 from ib_async import *
 
-import json
+import tomllib
 import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -15,30 +15,9 @@ import contract
 
 # TODO: rounding for dollar amounts??
 
-# TODO: toml config?
-PARAMS = {
-    # Interval between each iteration of the algo (seconds)
-    'INTERVAL': 10 * 60,
-    # Max money spent per day (dollars)
-    'MAX_PER_DAY': 2000,
-    # Minimum price of a stock before consider buying it (dollars)
-    'MIN_PRICE': 5,
-    # Maximum percentage of the portfolio that can be one stock
-    'MAX_PERCENTAGE_PER_STOCK': 0.03,
-    # Multiplier for the amount to spend on a particular stock
-    'SPEND_MULT': 0.05,
-    # Maximum percentage of buying power that can be spent on a particular stock at once
-    'MAX_BUYING_POWER_AT_ONCE': 0.02,
-    # Multiplier to calculate the take profit price for bracket orders (ask price * LIMIT_PRICE_MULT = limit_price)
-    'LIMIT_PRICE_MULT': 1.1,
-    # Percent away from the highest water mark for trailing stop orders
-    'TRAILING_STOP_PERCENT': 1,
-    # Time to cancel all orders and close out of all positions (24-hr, eastern time)
-    'CLOSING': {
-        'HOURS': 15,
-        'MINUTES': 30
-    }
-}
+# get config (we want this to be global)
+with open('config.toml', 'rb') as file:
+    config = tomllib.load(file)
 
 # TODO: errors?
 def get_account_value(account: list[AccountValue], tag: str):
@@ -57,8 +36,8 @@ def get_time_est():
 async def cleanup(ib: IB):
     now = get_time_est()
     cleanup_time = now.replace(
-        hour=PARAMS['CLOSING']['HOURS'],
-        minute=PARAMS['CLOSING']['MINUTES']
+        hour=config['closing'].hour,
+        minute=config['closing'].minute
     )
 
     # timestamp is in ms, convert to s for sleep
@@ -83,7 +62,7 @@ async def algo(ib: IB, contracts: list[Contract], money_spent: float):
 
     now = get_time_est()
 
-    if now.hour == PARAMS['CLOSING']['HOURS'] and now.minute + PARAMS['INTERVAL'] / 60 >= PARAMS['CLOSING']['MINUTES']:
+    if now.hour == config['closing'].hour and now.minute + config['interval'] >= config['closing'].minute:
         stop = True
 
     account_name, = ib.managedAccounts()
@@ -105,15 +84,15 @@ async def algo(ib: IB, contracts: list[Contract], money_spent: float):
         position_value = get_position(positions, contract.symbol) or 0 * ticker.marketPrice()
 
         notional = min(
-            ticker.volume * ticker.ask * PARAMS['SPEND_MULT'],
-            buying_power * PARAMS['MAX_BUYING_POWER_AT_ONCE']
+            ticker.volume * ticker.ask * config['spend_mult'],
+            buying_power * config['max_buying_power_at_once']
         )
 
-        stock_max_dollars = equity * PARAMS['MAX_PERCENTAGE_PER_STOCK']
+        stock_max_dollars = equity * config['max_percentage_per_stock']
 
         # TODO: should these be together
-        if position_value + notional > stock_max_dollars or money_spent + notional > PARAMS['MAX_PER_DAY']:
-            notional = min(stock_max_dollars - position_value, PARAMS['MAX_PER_DAY'] - money_spent)
+        if position_value + notional > stock_max_dollars or money_spent + notional > config['max_per_day']:
+            notional = min(stock_max_dollars - position_value, config['max_per_day'] - money_spent)
 
         qty = int(notional / ticker.marketPrice())
 
@@ -142,7 +121,7 @@ async def algo(ib: IB, contracts: list[Contract], money_spent: float):
             action='SELL',
             orderType='LMT',
             totalQuantity=qty,
-            lmtPrice=round(ticker.ask * PARAMS['LIMIT_PRICE_MULT'], 2),
+            lmtPrice=round(ticker.ask * config['limit_price_mult'], 2),
             parentId=parent.orderId,
             transmit=False
         )
@@ -151,7 +130,7 @@ async def algo(ib: IB, contracts: list[Contract], money_spent: float):
             action='SELL',
             orderType='TRAIL',
             totalQuantity=qty,
-            trailingPercent=PARAMS['TRAILING_STOP_PERCENT'],
+            trailingPercent=config['trailing_stop_percent'],
             parentId=parent.orderId,
             transmit=True
         )
@@ -160,7 +139,7 @@ async def algo(ib: IB, contracts: list[Contract], money_spent: float):
         ib.placeOrder(contract, take_profit)
         ib.placeOrder(contract, trailing_stop)
 
-        if money_spent + PARAMS['MIN_PRICE'] > PARAMS['MAX_PER_DAY']:
+        if money_spent + config['min_price'] > config['max_per_day']:
             stop = True
             break
 
@@ -181,7 +160,8 @@ async def main(contracts: list[Contract], port: int):
 
     while not stop:
         # TODO: this will loop an extra time on the last iteration
-        (stop, money_spent) = await asyncio.gather(algo(ib, contracts, money_spent), asyncio.sleep(PARAMS['INTERVAL']))
+        # convert config['interval'] to seconds for sleep
+        (stop, money_spent) = await asyncio.gather(algo(ib, contracts, money_spent), asyncio.sleep(config['interval'] * 60))
 
     ib.disconnect()
 
