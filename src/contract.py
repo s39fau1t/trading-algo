@@ -5,6 +5,8 @@ import json
 from argparse import ArgumentParser
 import logging
 
+FILENAME = 'contracts.json'
+
 def get_symbols():
     symbols = []
     url = 'https://api.polygon.io/v3/reference/tickers?market=stocks&exchange=XNYS&type=CS&active=true&order=asc&limit=1000&sort=ticker&apiKey=oQKFTzYK6JJpPfGiXleC3655nFo8e3r4'
@@ -37,13 +39,13 @@ def get_contracts(port: int):
 
     return [contract for contract in contracts if contract is not None]
 
-def save_contracts(path: str, contracts: list[Contract]):
-    with open(path, 'w') as file:
+def save_contracts(contracts: list[Contract]):
+    with open(FILENAME, 'w') as file:
         # TODO: only include essential properties
         json.dump([contract.__dict__ for contract in contracts], file)
 
-def read_contracts(path: str):
-    with open(path) as file:
+def read_contracts():
+    with open(FILENAME) as file:
         contracts = [Contract(**obj) for obj in json.load(file)]
     
     return contracts
@@ -66,4 +68,4 @@ if __name__ == '__main__':
 
     contracts = get_contracts(port)
 
-    save_contracts('contracts.json', contracts)
+    save_contracts(contracts)

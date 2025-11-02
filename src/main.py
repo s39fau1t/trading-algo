@@ -188,13 +188,13 @@ else:
 # try to get contracts from cache, if not request them and store in cache
 # TODO: when should cache be updated
 try:
-    contracts = contract.read_contracts('contracts.json')
+    contracts = contract.read_contracts()
 except FileNotFoundError:
     print('no contract cache, requesting contracts (this may take a while)')
 
     contracts = contract.get_contracts(port)
 
-    contract.save_contracts('contracts.json', contracts)
+    contract.save_contracts(contracts)
 
 print('starting algo...')
 
