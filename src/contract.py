@@ -9,7 +9,7 @@ FILENAME = 'contracts.json'
 
 def get_symbols():
     symbols = []
-    url = 'https://api.polygon.io/v3/reference/tickers?market=stocks&exchange=XNYS&type=CS&active=true&order=asc&limit=1000&sort=ticker&apiKey=oQKFTzYK6JJpPfGiXleC3655nFo8e3r4'
+    url = 'https://api.massive.com/v3/reference/tickers?market=stocks&exchange=XNYS&type=CS&active=true&order=asc&limit=1000&sort=ticker&apiKey=oQKFTzYK6JJpPfGiXleC3655nFo8e3r4'
 
     while True:
         res = json.loads(urllib.request.urlopen(urllib.request.Request(url)).read())
