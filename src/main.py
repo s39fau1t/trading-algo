@@ -1,4 +1,3 @@
-# TODO
 from ib_async import *
 
 import tomllib
@@ -9,11 +8,13 @@ from argparse import ArgumentParser
 
 import contract
 
-# TODO: we should utilize multithreading to get the most out of cpu
-
 # TODO: figure out ask vs market_price vs bid??
 
 # TODO: rounding for dollar amounts??
+
+# TODO: sorting (historical data?)
+
+# TODO: CLI (seperate processes)
 
 # get config (we want this to be global)
 with open('config.toml', 'rb') as file:
@@ -40,11 +41,13 @@ async def cleanup(ib: IB):
         minute=config['closing'].minute
     )
 
-    # timestamp is in ms, convert to s for sleep
-    await asyncio.sleep((cleanup_time.timestamp() - now.timestamp()) / 1000)
+    await asyncio.sleep(cleanup_time.timestamp() - now.timestamp())
 
     # cancel all orders
     ib.reqGlobalCancel()
+
+    # TODO: is this needed?
+    await asyncio.sleep(5)
 
     positions = ib.positions()
     for position in positions:
@@ -144,6 +147,8 @@ async def algo(ib: IB, contracts: list[Contract], money_spent: float):
             break
 
     if stop:
+        print('cleaning up')
+
         await cleanup(ib)
 
     return (stop, money_spent)
