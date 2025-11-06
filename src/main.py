@@ -12,8 +12,6 @@ import contract
 
 # TODO: rounding for dollar amounts??
 
-# TODO: sorting (historical data?)
-
 # TODO: CLI (seperate processes)
 
 # get config (we want this to be global)
@@ -58,26 +56,27 @@ async def cleanup(ib: IB):
         )
 
         ib.placeOrder(position.contract, sell_order)
+    
+    # TODO: await orders filling
 
 #TODO
-async def algo(ib: IB, contracts: list[Contract], money_spent: float):
+async def algo(ib: IB, contracts: list[Contract], prev_snapshots: dict[Ticker], money_spent: float):
     stop = False
 
     now = get_time_est()
-
     if now.hour == config['closing'].hour and now.minute + config['interval'] >= config['closing'].minute:
         stop = True
-
+    
     account_name, = ib.managedAccounts()
-
     positions = ib.positions(account_name)
 
-    for contract in contracts:
-        # request account and market data simultaneously to save time
-        account, (ticker,) = await asyncio.gather(
-            ib.accountSummaryAsync(account_name),
-            ib.reqTickersAsync(contract)
-        )
+    tickers = await ib.reqTickersAsync(*contracts)
+
+    to_buy = [ticker for ticker in tickers if prev_snapshots[ticker.contract.symbol].ask > 0 and ticker.ask >= config['min_price']]
+    to_buy.sort(key=lambda ticker: (ticker.ask - prev_snapshots[ticker.contract.symbol].ask) / prev_snapshots[ticker.contract.symbol], reverse=True)
+
+    for ticker in to_buy:
+        account = await ib.accountSummaryAsync(account_name)
 
         # TODO: use buying power or cash?
         buying_power = float(get_account_value(account, 'BuyingPower'))
@@ -151,7 +150,7 @@ async def algo(ib: IB, contracts: list[Contract], money_spent: float):
 
         await cleanup(ib)
 
-    return (stop, money_spent)
+    return (stop, {ticker.contract.symbol: ticker for ticker in tickers}, money_spent)
 
 async def main(contracts: list[Contract], port: int):
     ib = IB()
@@ -162,11 +161,14 @@ async def main(contracts: list[Contract], port: int):
 
     stop = False
     money_spent = 0
+    # TODO: use historical data so we don't need to wait
+    prev_snapshots = await ib.reqTickersAsync(*contracts)
+    await asyncio.sleep(config['interval'] * 60)
 
     while not stop:
         # TODO: this will loop an extra time on the last iteration
         # convert config['interval'] to seconds for sleep
-        (stop, money_spent) = await asyncio.gather(algo(ib, contracts, money_spent), asyncio.sleep(config['interval'] * 60))
+        (stop, prev_snapshots, money_spent) = await asyncio.gather(algo(ib, contracts, prev_snapshots, money_spent), asyncio.sleep(config['interval'] * 60))
 
     ib.disconnect()
 
