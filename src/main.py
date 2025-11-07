@@ -10,8 +10,6 @@ import contract
 
 # TODO: figure out ask vs market_price vs bid??
 
-# TODO: rounding for dollar amounts??
-
 # TODO: CLI (seperate processes)
 
 # get config (we want this to be global)
@@ -76,10 +74,10 @@ async def algo(ib: IB, contracts: list[Contract], prev_snapshots: dict[Ticker], 
     to_buy.sort(key=lambda ticker: (ticker.ask - prev_snapshots[ticker.contract.symbol].ask) / prev_snapshots[ticker.contract.symbol], reverse=True)
 
     for ticker in to_buy:
-        account = await ib.accountSummaryAsync(account_name)
+        account = ib.accountValues(account_name)
 
-        # TODO: use buying power or cash?
-        buying_power = float(get_account_value(account, 'BuyingPower'))
+        # TODO: use cash or settled cash?
+        buying_power = float(get_account_value(account, 'TotalCashBalance'))
         equity = float(get_account_value(account, 'TotalCashValue'))
 
         # estimate the current value of the position in dollars
