@@ -166,7 +166,10 @@ async def main(contracts: list[Contract], port: int):
     while not stop:
         # TODO: this will loop an extra time on the last iteration
         # convert config['interval'] to seconds for sleep
-        (stop, prev_snapshots, money_spent) = await asyncio.gather(algo(ib, contracts, prev_snapshots, money_spent), asyncio.sleep(config['interval'] * 60))
+        (stop, prev_snapshots, money_spent), = await asyncio.gather(
+            algo(ib, contracts, prev_snapshots, money_spent),
+            asyncio.sleep(config['interval'] * 60)
+        )
 
     ib.disconnect()
 
