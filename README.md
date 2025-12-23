@@ -15,11 +15,6 @@ cd src
 ```
 #### 4. Start TWS and [configure for API use](https://www.interactivebrokers.com/campus/trading-lessons/installing-configuring-tws-for-the-api/)
 #### 5. Run with uv
-If running on paper trading
 ```
-uv run main.py --paper
-```
-If running on live trading
-```
-uv run main.py --live
+uv run main.py
 ```

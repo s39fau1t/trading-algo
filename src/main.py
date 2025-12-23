@@ -4,13 +4,36 @@ import tomllib
 import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from argparse import ArgumentParser
+import logging
 
 import contract
 
 # TODO: figure out ask vs market_price vs bid??
 
-# TODO: CLI (seperate processes)
+# TODO: CLI (seperate processes??)
+
+# TODO: asyncio
+
+# TODO: coloring (not important)
+
+DEFAULT_PORTS = [
+    {
+        'name': 'TWS live trading',
+        'port': 7496
+    },
+    {
+        'name': 'IB Gateway live trading',
+        'port': 4001
+    },
+    {
+        'name': 'TWS paper trading',
+        'port': 7497
+    },
+    {
+        'name': 'IB Gateway paper trading',
+        'port': 4002
+    }
+]
 
 # get config (we want this to be global)
 with open('config.toml', 'rb') as file:
@@ -57,7 +80,6 @@ async def cleanup(ib: IB):
     
     # TODO: await orders filling
 
-#TODO
 async def algo(ib: IB, contracts: list[Contract], prev_snapshots: dict[Ticker], money_spent: float):
     stop = False
 
@@ -150,9 +172,40 @@ async def algo(ib: IB, contracts: list[Contract], prev_snapshots: dict[Ticker], 
 
     return (stop, {ticker.contract.symbol: ticker for ticker in tickers}, money_spent)
 
-async def main(contracts: list[Contract], port: int):
+async def main():
     ib = IB()
-    await ib.connectAsync(port=port)
+
+    # silence logging
+    ib._logger.setLevel(logging.CRITICAL)
+    ib.client._logger.setLevel(logging.CRITICAL)
+    ib.wrapper._logger.setLevel(logging.CRITICAL)
+
+    print('connecting...')
+
+    for port in DEFAULT_PORTS:
+        try:
+            await ib.connectAsync(port=port['port'])
+
+            print(f'connected to {port['name']}')
+            break
+        except:
+            pass
+
+    if not ib.isConnected():
+        print('failed to connect; make sure TWS or IB Gateway is open and configured for API use')
+
+        return
+
+    # try to get contracts from cache, if not request them and store in cache
+    # TODO: when should cache be updated??
+    try:
+        contracts = contract.read_contracts()
+    except FileNotFoundError:
+        print('no contract cache, requesting contracts (this may take a while)')
+
+        contracts = await contract.get_contracts(port)
+
+        contract.save_contracts(contracts)
 
     # use delayed data
     ib.reqMarketDataType(3)
@@ -173,32 +226,4 @@ async def main(contracts: list[Contract], port: int):
 
     ib.disconnect()
 
-# Get the port from command line args
-parser = ArgumentParser(prog='uv run main.py', epilog='Note: Port argument must match with whatever is selected in TWS otherwise it will not connect')
-group = parser.add_mutually_exclusive_group(required=True)
-group.add_argument('--live', action='store_true', help='connect to TWS over the default live trading port')
-group.add_argument('--paper', action='store_true', help='connect to TWS over the default paper trading port')
-group.add_argument('--port', type=int, help='connect to TWS over a custom port')
-
-args = parser.parse_args()
-if args.live:
-    port = 7496
-elif args.paper:
-    port = 7497
-else:
-    port = args.port
-
-# try to get contracts from cache, if not request them and store in cache
-# TODO: when should cache be updated
-try:
-    contracts = contract.read_contracts()
-except FileNotFoundError:
-    print('no contract cache, requesting contracts (this may take a while)')
-
-    contracts = contract.get_contracts(port)
-
-    contract.save_contracts(contracts)
-
-print('starting algo...')
-
-asyncio.run(main(contracts, port))
+asyncio.run(main())

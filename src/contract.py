@@ -3,7 +3,6 @@ from ib_async import IB, Contract, Stock
 import urllib.request
 import json
 from argparse import ArgumentParser
-import logging
 
 FILENAME = 'contracts.json'
 
@@ -23,19 +22,10 @@ def get_symbols():
     
     return [obj['ticker'].replace('.', ' ') for obj in symbols]
 
-def get_contracts(port: int):
-    ib = IB()
-    ib.connect(port=port)
-
-    ib._logger.setLevel(logging.CRITICAL)
-    ib.client._logger.setLevel(logging.CRITICAL)
-    ib.wrapper._logger.setLevel(logging.CRITICAL)
-
+async def get_contracts(ib: IB):
     symbols = get_symbols()
 
-    contracts = ib.qualifyContracts(*[Stock(symbol, 'SMART', 'USD') for symbol in symbols])
-
-    ib.disconnect()
+    contracts = await ib.qualifyContractsAsync(*[Stock(symbol, 'SMART', 'USD') for symbol in symbols])
 
     return [contract for contract in contracts if contract is not None]
 
@@ -50,7 +40,9 @@ def read_contracts():
     
     return contracts
 
+# TODO
 if __name__ == '__main__':
+    """
     # Get the port from command line args
     parser = ArgumentParser(prog='uv run main.py', epilog='Note: Port argument must match with whatever is selected in TWS otherwise it will not connect')
     group = parser.add_mutually_exclusive_group(required=True)
@@ -65,7 +57,10 @@ if __name__ == '__main__':
         port = 7497
     else:
         port = args.port
+    
 
     contracts = get_contracts(port)
 
     save_contracts(contracts)
+    """
+    pass
