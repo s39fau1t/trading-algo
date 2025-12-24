@@ -4,6 +4,7 @@ import tomllib
 import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from argparse import ArgumentParser
 import logging
 
 import contract
@@ -19,19 +20,24 @@ import contract
 DEFAULT_PORTS = [
     {
         'name': 'TWS live trading',
-        'port': 7496
+        'port': 7496,
+        # TODO
+        'live': False
     },
     {
         'name': 'IB Gateway live trading',
-        'port': 4001
+        'port': 4001,
+        'live': True
     },
     {
         'name': 'TWS paper trading',
-        'port': 7497
+        'port': 7497,
+        'live': False
     },
     {
         'name': 'IB Gateway paper trading',
-        'port': 4002
+        'port': 4002,
+        'live': True
     }
 ]
 
@@ -80,7 +86,7 @@ async def cleanup(ib: IB):
     
     # TODO: await orders filling
 
-async def algo(ib: IB, contracts: list[Contract], prev_snapshots: dict[Ticker], money_spent: float):
+async def algo(ib: IB, contracts: list[Contract], prev_snapshots: dict[str, Ticker], money_spent: float):
     stop = False
 
     now = get_time_est()
@@ -93,7 +99,7 @@ async def algo(ib: IB, contracts: list[Contract], prev_snapshots: dict[Ticker], 
     tickers = await ib.reqTickersAsync(*contracts)
 
     to_buy = [ticker for ticker in tickers if prev_snapshots[ticker.contract.symbol].ask > 0 and ticker.ask >= config['min_price']]
-    to_buy.sort(key=lambda ticker: (ticker.ask - prev_snapshots[ticker.contract.symbol].ask) / prev_snapshots[ticker.contract.symbol], reverse=True)
+    to_buy.sort(key=lambda ticker: (ticker.ask - prev_snapshots[ticker.contract.symbol].ask) / prev_snapshots[ticker.contract.symbol].ask, reverse=True)
 
     for ticker in to_buy:
         account = ib.accountValues(account_name)
@@ -172,19 +178,30 @@ async def algo(ib: IB, contracts: list[Contract], prev_snapshots: dict[Ticker], 
 
     return (stop, {ticker.contract.symbol: ticker for ticker in tickers}, money_spent)
 
-async def main():
+async def main(args):
     ib = IB()
 
     # silence logging
-    ib._logger.setLevel(logging.CRITICAL)
-    ib.client._logger.setLevel(logging.CRITICAL)
-    ib.wrapper._logger.setLevel(logging.CRITICAL)
+    #ib._logger.setLevel(logging.CRITICAL)
+    #ib.client._logger.setLevel(logging.CRITICAL)
+    #ib.wrapper._logger.setLevel(logging.CRITICAL)
+    ib._logger.setLevel(logging.DEBUG)
+    ib.client._logger.setLevel(logging.DEBUG)
+    ib.wrapper._logger.setLevel(logging.DEBUG)
 
     print('connecting...')
 
+    # try to connect to TWS/IB Gateway default ports
     for port in DEFAULT_PORTS:
         try:
             await ib.connectAsync(port=port['port'])
+
+            # live trading confirmation
+            if port['live'] and not args.yes:
+                y_n = input('about to connect to live trading, press y to continue\n').lower()
+
+                if y_n not in ['y', 'yes']:
+                    return
 
             print(f'connected to {port['name']}')
             break
@@ -203,9 +220,11 @@ async def main():
     except FileNotFoundError:
         print('no contract cache, requesting contracts (this may take a while)')
 
-        contracts = await contract.get_contracts(port)
+        contracts = await contract.get_contracts(ib)
 
         contract.save_contracts(contracts)
+    
+    print('starting algo...')
 
     # use delayed data
     ib.reqMarketDataType(3)
@@ -213,7 +232,9 @@ async def main():
     stop = False
     money_spent = 0
     # TODO: use historical data so we don't need to wait
-    prev_snapshots = await ib.reqTickersAsync(*contracts)
+    tickers = await ib.reqTickersAsync(*contracts)
+    prev_snapshots = {ticker.contract.symbol: ticker for ticker in tickers}
+
     await asyncio.sleep(config['interval'] * 60)
 
     while not stop:
@@ -226,4 +247,9 @@ async def main():
 
     ib.disconnect()
 
-asyncio.run(main())
+parser = ArgumentParser(prog='uv run main.py')
+parser.add_argument('--yes', action='store_true', help='Connect to live trading without confirmation')
+
+args = parser.parse_args()
+
+asyncio.run(main(args))
