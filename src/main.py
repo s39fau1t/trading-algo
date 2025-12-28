@@ -1,7 +1,6 @@
 from ib_async import *
 
 import tomllib
-import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from argparse import ArgumentParser
@@ -13,15 +12,12 @@ import contract
 
 # TODO: CLI (seperate processes??)
 
-# TODO: asyncio
-
 # TODO: coloring (not important)
 
 DEFAULT_PORTS = [
     {
         'name': 'TWS live trading',
         'port': 7496,
-        # TODO
         'live': False
     },
     {
@@ -59,20 +55,20 @@ def get_position(positions: list[Position], symbol: str):
 def get_time_est():
     return datetime.now(ZoneInfo('US/Eastern'))
 
-async def cleanup(ib: IB):
+def cleanup(ib: IB):
     now = get_time_est()
     cleanup_time = now.replace(
         hour=config['closing'].hour,
         minute=config['closing'].minute
     )
 
-    await asyncio.sleep(cleanup_time.timestamp() - now.timestamp())
+    ib.sleep(cleanup_time.timestamp() - now.timestamp())
 
     # cancel all orders
     ib.reqGlobalCancel()
 
     # TODO: is this needed?
-    await asyncio.sleep(5)
+    ib.sleep(5)
 
     positions = ib.positions()
     for position in positions:
@@ -86,7 +82,7 @@ async def cleanup(ib: IB):
     
     # TODO: await orders filling
 
-async def algo(ib: IB, contracts: list[Contract], prev_snapshots: dict[str, Ticker], money_spent: float):
+def algo(ib: IB, contracts: list[Contract], prev_snapshots: dict[str, Ticker], money_spent: float):
     stop = False
 
     now = get_time_est()
@@ -96,7 +92,7 @@ async def algo(ib: IB, contracts: list[Contract], prev_snapshots: dict[str, Tick
     account_name, = ib.managedAccounts()
     positions = ib.positions(account_name)
 
-    tickers = await ib.reqTickersAsync(*contracts)
+    tickers = ib.reqTickers(*contracts)
 
     to_buy = [ticker for ticker in tickers if prev_snapshots[ticker.contract.symbol].ask > 0 and ticker.ask >= config['min_price']]
     to_buy.sort(key=lambda ticker: (ticker.ask - prev_snapshots[ticker.contract.symbol].ask) / prev_snapshots[ticker.contract.symbol].ask, reverse=True)
@@ -109,7 +105,7 @@ async def algo(ib: IB, contracts: list[Contract], prev_snapshots: dict[str, Tick
         equity = float(get_account_value(account, 'TotalCashValue'))
 
         # estimate the current value of the position in dollars
-        position_value = get_position(positions, contract.symbol) or 0 * ticker.marketPrice()
+        position_value = (get_position(positions, contract.symbol) or 0) * ticker.marketPrice()
 
         notional = min(
             ticker.volume * ticker.ask * config['spend_mult'],
@@ -174,27 +170,28 @@ async def algo(ib: IB, contracts: list[Contract], prev_snapshots: dict[str, Tick
     if stop:
         print('cleaning up')
 
-        await cleanup(ib)
+        cleanup(ib)
 
     return (stop, {ticker.contract.symbol: ticker for ticker in tickers}, money_spent)
 
-async def main(args):
+def main():
+    # command line args
+    parser = ArgumentParser(prog='uv run main.py')
+    parser.add_argument('--yes', action='store_true', help='Connect to live trading without confirmation')
+
+    args = parser.parse_args()
+
     ib = IB()
 
-    # silence logging
-    #ib._logger.setLevel(logging.CRITICAL)
-    #ib.client._logger.setLevel(logging.CRITICAL)
-    #ib.wrapper._logger.setLevel(logging.CRITICAL)
-    ib._logger.setLevel(logging.DEBUG)
-    ib.client._logger.setLevel(logging.DEBUG)
-    ib.wrapper._logger.setLevel(logging.DEBUG)
+    # logging
+    util.logToFile('log.txt', logging.DEBUG)
 
     print('connecting...')
 
     # try to connect to TWS/IB Gateway default ports
     for port in DEFAULT_PORTS:
         try:
-            await ib.connectAsync(port=port['port'])
+            ib.connect(port=port['port'])
 
             # live trading confirmation
             if port['live'] and not args.yes:
@@ -220,10 +217,10 @@ async def main(args):
     except FileNotFoundError:
         print('no contract cache, requesting contracts (this may take a while)')
 
-        contracts = await contract.get_contracts(ib)
+        contracts = contract.get_contracts(ib)
 
         contract.save_contracts(contracts)
-    
+
     print('starting algo...')
 
     # use delayed data
@@ -232,24 +229,17 @@ async def main(args):
     stop = False
     money_spent = 0
     # TODO: use historical data so we don't need to wait
-    tickers = await ib.reqTickersAsync(*contracts)
+    tickers = ib.reqTickers(*contracts)
     prev_snapshots = {ticker.contract.symbol: ticker for ticker in tickers}
 
-    await asyncio.sleep(config['interval'] * 60)
+    ib.sleep(config['interval'] * 60)
 
     while not stop:
         # TODO: this will loop an extra time on the last iteration
         # convert config['interval'] to seconds for sleep
-        (stop, prev_snapshots, money_spent), = await asyncio.gather(
-            algo(ib, contracts, prev_snapshots, money_spent),
-            asyncio.sleep(config['interval'] * 60)
-        )
-
+        stop, prev_snapshots, money_spent = algo(ib, contracts, prev_snapshots, money_spent)
+        ib.sleep(config['interval'] * 60)
+    
     ib.disconnect()
 
-parser = ArgumentParser(prog='uv run main.py')
-parser.add_argument('--yes', action='store_true', help='Connect to live trading without confirmation')
-
-args = parser.parse_args()
-
-asyncio.run(main(args))
+main()

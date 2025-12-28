@@ -22,10 +22,10 @@ def get_symbols():
     
     return [obj['ticker'].replace('.', ' ') for obj in symbols]
 
-async def get_contracts(ib: IB):
+def get_contracts(ib: IB):
     symbols = get_symbols()
 
-    contracts = await ib.qualifyContractsAsync(*[Stock(symbol, 'SMART', 'USD') for symbol in symbols])
+    contracts = ib.qualifyContracts(*[Stock(symbol, 'SMART', 'USD') for symbol in symbols])
 
     return [contract for contract in contracts if contract is not None]
 
