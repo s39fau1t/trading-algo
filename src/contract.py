@@ -1,8 +1,32 @@
-from ib_async import IB, Contract, Stock
+from ib_async import IB, Contract, Stock, util
 
 import urllib.request
 import json
-from argparse import ArgumentParser
+import logging
+import sys
+
+DEFAULT_PORTS = [
+    {
+        'name': 'TWS live trading',
+        'port': 7496,
+        'live': False
+    },
+    {
+        'name': 'IB Gateway live trading',
+        'port': 4001,
+        'live': True
+    },
+    {
+        'name': 'TWS paper trading',
+        'port': 7497,
+        'live': False
+    },
+    {
+        'name': 'IB Gateway paper trading',
+        'port': 4002,
+        'live': True
+    }
+]
 
 FILENAME = 'contracts.json'
 
@@ -40,27 +64,26 @@ def read_contracts():
     
     return contracts
 
-# TODO
 if __name__ == '__main__':
-    """
-    # Get the port from command line args
-    parser = ArgumentParser(prog='uv run main.py', epilog='Note: Port argument must match with whatever is selected in TWS otherwise it will not connect')
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--live', action='store_true', help='connect to TWS over the default live trading port')
-    group.add_argument('--paper', action='store_true', help='connect to TWS over the default paper trading port')
-    group.add_argument('--port', type=int, help='connect to TWS over a custom port')
+    ib = IB()
 
-    args = parser.parse_args()
-    if args.live:
-        port = 7496
-    elif args.paper:
-        port = 7497
-    else:
-        port = args.port
-    
+    util.logToConsole(logging.CRITICAL)
 
-    contracts = get_contracts(port)
+    for port in DEFAULT_PORTS:
+            try:
+                ib.connect(port=port['port'])
+
+                break
+            except:
+                pass
+
+    if not ib.isConnected():
+        print('failed to connect; make sure TWS or IB Gateway is open and configured for API use')
+
+        sys.exit()
+
+    contracts = get_contracts(ib)
 
     save_contracts(contracts)
-    """
-    pass
+
+    ib.disconnect()
