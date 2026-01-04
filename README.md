@@ -13,7 +13,7 @@ cd trading-algo
 git checkout ibkr
 cd src
 ```
-#### 4. Start TWS and [configure for API use](https://www.interactivebrokers.com/campus/trading-lessons/installing-configuring-tws-for-the-api/)
+#### 4. Start TWS/IB Gateway and [configure for API use](https://www.interactivebrokers.com/campus/trading-lessons/installing-configuring-tws-for-the-api/)
 #### 5. Run with uv
 ```
 uv run main.py
