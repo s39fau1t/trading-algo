@@ -1,7 +1,7 @@
 from ib_async import *
 
 import tomllib
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from argparse import ArgumentParser
 import logging
@@ -10,7 +10,7 @@ import sys
 
 import connect
 
-# TODO: scanner (contract cache not needed anymore?)
+# scanner
 # https://www.youtube.com/watch?v=E2JE8fPaC5s&list=PLCZZtBmmgxn8CFKysCkcl-B1tqRgCCNIX&index=27
 
 
@@ -65,24 +65,28 @@ def cleanup(ib: IB):
     
     # TODO: await orders filling
 
-def algo(ib: IB, contracts: list[Contract], prev_snapshots: dict[str, Ticker], money_spent: float):
+def algo(ib: IB, tickers: list[dict[str, Ticker]], money_spent: float):
     stop = False
 
     now = get_time_est()
     if now.hour == config['closing'].hour and now.minute + config['interval'] >= config['closing'].minute:
         stop = True
     
+    # TODO: account name??
     account_name, = ib.managedAccounts()
     positions = ib.positions(account_name)
 
-    # TODO: use historical minute bar for volume
-    tickers = ib.reqTickers(*contracts)
+    cur = tickers[-1]
+    last = tickers[-2]
+    prev = tickers[0]
 
-    to_buy = [ticker for ticker in tickers if prev_snapshots[ticker.contract.symbol].ask > 0 and ticker.ask >= config['min_price']]
-    to_buy.sort(key=lambda ticker: (ticker.ask - prev_snapshots[ticker.contract.symbol].ask) / prev_snapshots[ticker.contract.symbol].ask, reverse=True)
+    to_buy = [ticker for ticker in cur.values() if prev[ticker.contract.symbol].ask > 0 and ticker.ask >= config['min_price']]
+    to_buy.sort(key=lambda ticker: (ticker.ask - prev[ticker.contract.symbol].ask) / prev[ticker.contract.symbol].ask, reverse=True)
 
     for ticker in to_buy:
         contract = ticker.contract
+
+        volume = ticker.volume - last[ticker.contract.symbol].volume
 
         account = ib.accountValues(account_name)
 
@@ -94,7 +98,7 @@ def algo(ib: IB, contracts: list[Contract], prev_snapshots: dict[str, Ticker], m
         position_value = (get_position(positions, contract.symbol) or 0) * ticker.marketPrice()
 
         notional = min(
-            ticker.volume * ticker.ask * config['spend_mult'],
+            volume * ticker.ask * config['spend_mult'],
             buying_power * config['max_buying_power_at_once']
         )
 
@@ -158,7 +162,7 @@ def algo(ib: IB, contracts: list[Contract], prev_snapshots: dict[str, Ticker], m
 
         cleanup(ib)
 
-    return (stop, {ticker.contract.symbol: ticker for ticker in tickers}, money_spent)
+    return stop, money_spent
 
 # command line args
 parser = ArgumentParser(prog='uv run main.py')
@@ -185,17 +189,23 @@ print('starting algo...')
 
 stop = False
 money_spent = 0
-# TODO: use historical data so we don't need to wait
-tickers = ib.reqTickers(*contracts)
-prev_snapshots = {ticker.contract.symbol: ticker for ticker in tickers}
 
-ib.sleep(config['interval'] * 60)
+# TODO: deque?
+tickers = []
 
+# TODO: consider config
 while not stop:
-    # TODO: this will loop an extra time on the last iteration
-    # TODO: use time elapsed
-    # convert config['interval'] to seconds for sleep
-    stop, prev_snapshots, money_spent = algo(ib, contracts, prev_snapshots, money_spent)
-    ib.sleep(config['interval'] * 60)
+    next_iter = datetime.now() + timedelta(minutes=1)
+
+    tickers = ib.reqTickers(*contracts)
+
+    tickers.append({ticker.contract.symbol: ticker for ticker in tickers})
+
+    if len(tickers) == 11:
+        stop, money_spent = algo(ib, tickers, money_spent)
+
+        tickers.pop(0)
+
+    ib.sleep(next_iter.timestamp() - datetime.now().timestamp())
 
 ib.disconnect()

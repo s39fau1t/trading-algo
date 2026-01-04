@@ -10,7 +10,6 @@ import connect
 
 FILENAME = 'contracts.json'
 
-# from contract.py (TODO)
 def get_symbols() -> list[str]:
     symbols = []
     url = 'https://api.massive.com/v3/reference/tickers?market=stocks&exchange=XNAS&type=CS&active=true&order=asc&limit=1000&sort=ticker&apiKey=oQKFTzYK6JJpPfGiXleC3655nFo8e3r4'

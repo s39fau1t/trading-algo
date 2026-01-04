@@ -1,2 +1,1 @@
 1. fix total spent calculation; estimate worst case and pause until orders are filled if it goes over; when orders are filled keep going if we still have money left to spend
-2. use historical data so 1st iteration isn't delayed (allows for shorter interval?)
