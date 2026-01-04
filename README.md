@@ -1,4 +1,7 @@
-Dev branch for algo implementation in IBKR TWS API (python)  
+TWS algo implementation using a custom market scanner `scanner.py`
+
+
+
 [uv](https://github.com/astral-sh/uv) is used for dependency management
 
 ### To run:
