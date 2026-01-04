@@ -89,7 +89,7 @@ if __name__ == '__main__':
 
     # batch request data (groups of 90, generic ticks)
     tickers = get_tickers_batched(ib, contracts)
-    tickers = [ticker for ticker in tickers if ticker is not None]
+    tickers = [ticker for ticker in tickers if ticker is not None and hasattr(ticker.fundamentalRatios, 'MKTCAP')]
 
     # filter based on that
     contracts = [ticker.contract for ticker in tickers if ticker.close > 10 and ticker.avVolume * 100 > 1_000_000 and ticker.fundamentalRatios.MKTCAP * 1_000_000 > 300_000_000]
