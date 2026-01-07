@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from argparse import ArgumentParser
 import logging
-import json
 import sys
 
 import connect

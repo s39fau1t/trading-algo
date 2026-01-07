@@ -9,7 +9,7 @@ max_percentage_per_stock = 0.03
 # Multiplier for the amount to spend on a particular stock
 spend_mult = 0.05
 # Maximum percentage of buying power that can be spent on a particular stock at once
-max_buying_power_at_once = 0.02
+max_buying_power_at_once = 0.1
 # Multiplier to calculate the take profit price for bracket orders (ask price * LIMIT_PRICE_MULT = limit_price)
 limit_price_mult = 1.1
 # Percent away from the highest water mark for trailing stop orders
