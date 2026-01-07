@@ -1,7 +1,7 @@
-TWS algo implementation using a custom market scanner `scanner.py`
-
-
-
+TWS algo implementation using a custom market scanner `filter.py`
+<br>
+<br>
+<br>
 [uv](https://github.com/astral-sh/uv) is used for dependency management
 
 ### To run:
@@ -17,7 +17,11 @@ git checkout ibkr
 cd src
 ```
 #### 4. Start TWS/IB Gateway and [configure for API use](https://www.interactivebrokers.com/campus/trading-lessons/installing-configuring-tws-for-the-api/)
-#### 5. Run with uv
+#### 5. Run custom scanner script
+```
+uv run filter.py
+```
+#### 6. Run main algo
 ```
 uv run main.py
 ```
