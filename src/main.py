@@ -65,30 +65,30 @@ def cleanup(ib: IB):
     
     # TODO: await orders filling
 
-def algo(ib: IB, tickers: list[dict[str, Ticker]], money_spent: float):
-    stop = False
+def algo(ib: IB):
+    money_spent = 0
 
-    now = get_time_est()
-    if now.hour == config['closing'].hour and now.minute + config['interval'] >= config['closing'].minute:
-        stop = True
-    
-    # TODO: account name??
-    account_name, = ib.managedAccounts()
-    positions = ib.positions(account_name)
+    sub = ScannerSubscription(
+        numberOfRows=50,
+        instrument='STK',
+        locationCode='STK.US.MAJOR',
+        scanCode='TOP_OPEN_PERC_GAIN',
+        abovePrice=10,
+    )
 
-    cur = tickers[-1]
-    last = tickers[-2]
-    prev = tickers[0]
+    scan_list = ib.reqScannerData(sub)
+    contracts = [stk.contractDetails.contract for stk in scan_list]
 
-    to_buy = [ticker for ticker in cur.values() if prev[ticker.contract.symbol].ask > 0 and ticker.ask >= config['min_price']]
-    to_buy.sort(key=lambda ticker: (ticker.ask - prev[ticker.contract.symbol].ask) / prev[ticker.contract.symbol].ask, reverse=True)
+    positions = ib.positions()
 
-    for ticker in to_buy:
-        contract = ticker.contract
+    for contract in contracts:
+        ticker = ib.reqTickers(contract)
 
-        volume = ticker.volume - last[ticker.contract.symbol].volume
+        #                                                    because delayed data
+        bar = ib.reqHistoricalData(contract, endDateTime='', durationStr='900 S', barSizeSetting='1 min', whatToShow='TRADES', useRTH=True)
+        volume = bar[0].volume
 
-        account = ib.accountValues(account_name)
+        account = ib.accountValues()
 
         # TODO: use cash or settled cash?
         buying_power = float(get_account_value(account, 'TotalCashBalance'))
@@ -154,15 +154,12 @@ def algo(ib: IB, tickers: list[dict[str, Ticker]], money_spent: float):
         ib.placeOrder(contract, trailing_stop)
 
         if money_spent + config['min_price'] > config['max_per_day']:
-            stop = True
             break
 
-    if stop:
-        print('cleaning up')
+    # TODO: cleanup
+    print('cleaning up')
 
-        cleanup(ib)
-
-    return stop, money_spent
+    cleanup(ib)
 
 # command line args
 parser = ArgumentParser(prog='uv run main.py')
@@ -180,32 +177,10 @@ ib.reqMarketDataType(3)
 # logging
 util.logToFile('log.txt', logging.DEBUG)
 
-with open('contracts.json') as file:
-    contr_json = json.load(file)
-
-    contracts = [Contract(**obj) for obj in contr_json]
-
 print('starting algo...')
 
-stop = False
-money_spent = 0
-
-# TODO: deque?
-tickers = []
-
-# TODO: consider config
-while not stop:
-    next_iter = datetime.now() + timedelta(minutes=1)
-
-    tickers = ib.reqTickers(*contracts)
-
-    tickers.append({ticker.contract.symbol: ticker for ticker in tickers})
-
-    if len(tickers) == 11:
-        stop, money_spent = algo(ib, tickers, money_spent)
-
-        tickers.pop(0)
-
-    ib.sleep(next_iter.timestamp() - datetime.now().timestamp())
+# only one iteration 
+# TODO: algo func not technically needed now
+algo()
 
 ib.disconnect()
