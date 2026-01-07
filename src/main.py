@@ -77,6 +77,8 @@ def algo(ib: IB):
     )
 
     scan_list = ib.reqScannerData(sub)
+    scan_list = scan_list[0:9]
+
     contracts = [stk.contractDetails.contract for stk in scan_list]
 
     positions = ib.positions()
