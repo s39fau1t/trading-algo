@@ -182,6 +182,6 @@ print('starting algo...')
 
 # only one iteration 
 # TODO: algo func not technically needed now
-algo()
+algo(ib)
 
 ib.disconnect()
