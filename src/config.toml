@@ -14,5 +14,7 @@ max_buying_power_at_once = 0.1
 limit_price_mult = 1.1
 # Percent away from the highest water mark for trailing stop orders
 trailing_stop_percent = 1
+# Time to start the algo (24-hr, eastern time)
+start_time = 09:40:00
 # Time to cancel all orders and close out of all positions (24-hr, eastern time)
-closing = 15:30:00
+close_time = 15:30:00

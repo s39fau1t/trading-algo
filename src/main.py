@@ -1,8 +1,9 @@
 from ib_async import *
 
 import tomllib
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
+import time
 from argparse import ArgumentParser
 import logging
 import sys
@@ -37,11 +38,26 @@ def get_position(positions: list[Position], symbol: str):
 def get_time_est():
     return datetime.now(ZoneInfo('US/Eastern'))
 
+def wait_for_open():
+    now = get_time_est()
+
+    start_time = now.replace(
+        hour=config['start_time'].hour,
+        minute=config['start_time'].minute,
+    )
+
+    if start_time < now:
+        print('start time already passed for today')
+
+        sys.exit()
+
+    time.sleep(start_time.timestamp() - now.timestamp())
+
 def cleanup(ib: IB):
     now = get_time_est()
     cleanup_time = now.replace(
-        hour=config['closing'].hour,
-        minute=config['closing'].minute
+        hour=config['close_time'].hour,
+        minute=config['close_time'].minute
     )
 
     ib.sleep(cleanup_time.timestamp() - now.timestamp())
@@ -167,6 +183,8 @@ parser = ArgumentParser(prog='uv run main.py')
 parser.add_argument('--yes', action='store_true', help='Connect to live trading without confirmation')
 
 args = parser.parse_args()
+
+wait_for_open()
 
 ib = connect.new_api_connection(not args.yes)
 if ib is None:
