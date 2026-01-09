@@ -47,7 +47,10 @@ def wait_for_open():
     )
 
     if start_time < now:
-        print('start time already passed for today')
+        y_n = input('start time already passed for today; press y to continue anyway\n')
+
+        if y_n in ['y', 'yes']:
+            return
 
         sys.exit()
 
