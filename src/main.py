@@ -83,11 +83,11 @@ def algo(ib: IB):
     positions = ib.positions()
 
     for contract in contracts:
-        ticker = ib.reqTickers(contract)
+        ticker, = ib.reqTickers(contract)
 
         #                                                    because delayed data
-        bar = ib.reqHistoricalData(contract, endDateTime='', durationStr='900 S', barSizeSetting='1 min', whatToShow='TRADES', useRTH=True)
-        volume = bar[0].volume
+        bars = ib.reqHistoricalData(contract, endDateTime='', durationStr='960 S', barSizeSetting='1 min', whatToShow='TRADES', useRTH=True)
+        volume = bars[-1].volume
 
         account = ib.accountValues()
 
