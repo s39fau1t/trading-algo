@@ -13,9 +13,6 @@ import connect
 # scanner
 # https://www.youtube.com/watch?v=E2JE8fPaC5s&list=PLCZZtBmmgxn8CFKysCkcl-B1tqRgCCNIX&index=27
 
-
-# TODO: figure out ask vs market_price vs bid??
-
 # TODO: CLI (seperate processes??)
 
 # TODO: coloring (not important)
@@ -137,7 +134,7 @@ def algo(ib: IB):
         # worst case money spent; TODO: is that right?
         money_spent += round(qty * ticker.ask, 2)
 
-        print(f'buying {qty} shares of {contract.symbol} with estimated spending {qty * ticker.ask} and current total spending {money_spent}')
+        print(f'buying {qty} shares of {contract.symbol} @ {ticker.ask} with estimated spending {qty * ticker.ask} and current total spending {money_spent}')
 
         # place bracket order
         # https://interactivebrokers.github.io/tws-api/available_orders.html
@@ -197,7 +194,7 @@ if ib is None:
 ib.reqMarketDataType(3)
 
 # logging
-util.logToFile('log.txt', logging.DEBUG)
+util.logToFile('log.txt', logging.INFO)
 
 print('starting algo...')
 
